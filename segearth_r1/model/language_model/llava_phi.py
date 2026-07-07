@@ -144,7 +144,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         self.origin_SEG_token_projector = nn.Linear(self.config.hidden_size, additional_dim)
         self.local_project = nn.Linear(local_fea_dim[-1], additional_dim)
         self.SEG_token_projector = nn.Linear(2 * additional_dim, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
-        self.d_layers = D_Projector(dim=additional_dim, depth=1, dim_head=64, heads=8, ff_mult=1)       
+        self.d_layers = D_Projector(dim=additional_dim, depth=2, dim_head=64, heads=8, ff_mult=1)       
         
         if is_train_mask_decode:
             print('Mask Decoder has been trained, init directly')
@@ -172,16 +172,18 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             def get_w(weights, keyword):
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}  # 获取keyword的参数
             def change_w(weights, old_name, new_name): # 为参数改名
-                weights[new_name] = weights[old_name]
-                weights.pop(old_name)
+                if old_name in weights:
+                    weights[new_name] = weights[old_name]
+                    weights.pop(old_name)
 
             if pretrained_path.endswith('.pkl'):
                 with open(pretrained_path, 'rb') as f:
                     ckpt = pickle.load(f)
             else:
                 ckpt = torch.load(pretrained_path)
-            pixel_decoder_weights = get_w(ckpt['model'],'sem_seg_head.pixel_decoder')
-            predictor_weights = get_w(ckpt['model'],'sem_seg_head.predictor')
+            model_weights = ckpt['model'] if 'model' in ckpt else ckpt
+            pixel_decoder_weights = get_w(model_weights, 'sem_seg_head.pixel_decoder')
+            predictor_weights = get_w(model_weights, 'sem_seg_head.predictor')
             pixel_decoder_weights = {k: torch.tensor(v) for k, v in pixel_decoder_weights.items()}
             predictor_weights = {k: torch.tensor(v) for k, v in predictor_weights.items()}
 
@@ -206,8 +208,10 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
     # def mask_token_processor()
 
     def get_vision_tower_feature(self, images):
-        with torch.no_grad():
-            features = self.get_model().get_vision_tower()(images)
+        if getattr(self, '_cached_raw_features', None) is None:
+            with torch.no_grad():
+                self._cached_raw_features = self.get_model().get_vision_tower()(images)
+        features = self._cached_raw_features
         features_dict = {
             'res2': features[0],
             'res3': features[1],
@@ -270,9 +274,10 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             "scores": scores,
         }
     def encode_images(self, images):
-        with torch.no_grad():
-            image_features = self.get_model().get_vision_tower()(images)
-        image_features = self.get_model().mm_projector(image_features)
+        if getattr(self, '_cached_raw_features', None) is None:
+            with torch.no_grad():
+                self._cached_raw_features = self.get_model().get_vision_tower()(images)
+        image_features = self.get_model().mm_projector(self._cached_raw_features)
         return image_features
 
     def predictor_init(self, cfg):
@@ -712,6 +717,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         dataset_type: Optional[str] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        self._cached_raw_features = None
         if dataset_type is not None:
             assert all(item == dataset_type[0] for item in dataset_type), f'this batch contain different dataset_type: {dataset_type}'
             batch_dataset_type = dataset_type[0]
@@ -747,7 +753,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         logits = self.lm_head(hidden_states)
 
         loss = None
-        if batch_dataset_type == 'mm_conv' or batch_dataset_type == 'reason_seg': 
+        if batch_dataset_type in ['mm_conv', 'reason_seg', 'refer_seg']: 
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
@@ -757,7 +763,10 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             shift_labels = shift_labels.view(-1)
             # Enable model/pipeline parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            llm_loss = loss_fct(shift_logits, shift_labels)
+            if (shift_labels != -100).any():
+                llm_loss = loss_fct(shift_logits, shift_labels)
+            else:
+                llm_loss = torch.tensor(0.0, device=shift_logits.device)
 
         if batch_dataset_type == 'refer_seg' or batch_dataset_type == 'reason_seg':
             if self.use_seg_query:
@@ -828,8 +837,8 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 mask_loss = loss_mask + loss_dice + loss_SEG_class
                 if isinstance(loss_SEG_class, float):
                     loss_SEG_class = torch.tensor(loss_SEG_class, device=mask_loss.device)
-                if batch_dataset_type == 'refer_seg':
-                    llm_loss = torch.tensor(0.0, device=mask_loss.device)
+                # if batch_dataset_type == 'refer_seg':
+                #     llm_loss = torch.tensor(0.0, device=mask_loss.device)
             loss = llm_loss + mask_loss
                 
         if batch_dataset_type == 'mm_conv':
@@ -1018,6 +1027,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         answer_embedding_indices: Optional[torch.LongTensor] = None,
         is_thing_list: Optional[torch.Tensor] = None,
     ):  
+        self._cached_raw_features = None
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

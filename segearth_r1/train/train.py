@@ -83,6 +83,7 @@ class ModelArguments:
     dino_path: Optional[str] = field(default=None)
     process_depth: Optional[int] = field(default=1)
     use_seg_query: bool = field(default=False)
+    mask2former_checkpoint: Optional[str] = field(default=None)
 
 @dataclass
 class DataArguments:
@@ -372,7 +373,7 @@ def train():
         **bnb_model_from_pretrained_args)
     
     if not model.is_train_mask_decode:
-        mask2former_ckpt = model_args.vision_tower if model_args.load_mask2former else None
+        mask2former_ckpt = model_args.mask2former_checkpoint if model_args.mask2former_checkpoint is not None else (model_args.vision_tower if model_args.load_mask2former else None)
         model.initial_mask_module(mask2former_ckpt)
 
     model.config.use_cache = False

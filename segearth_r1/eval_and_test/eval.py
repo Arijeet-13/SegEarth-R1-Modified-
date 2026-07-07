@@ -160,6 +160,11 @@ class DataArguments:
     use_seg_query: bool = False
     dataset_type: Optional[str] = field(default="RRSIS-D")
     vis_path: Optional[str] = field(default=None)
+    scaling_type: Optional[str] = field(default=None) #For parallel_reasoning, sequential_reasoning or parallel_referring
+    scaling_n: int = field(default=8) #For number of samples (N) for parallel_reasoning: Number of text-and-mask samples generated; sequential_reasoning: The maximum number of self-critique rounds
+    # parallel_referring: Determines how many image resolutions/scales to process in TTA.
+    scaling_temp: float = field(default=1.0) #Amount of variation in the generated samples.
+    scaling_aggregator: str = field(default="average")       # 'average', 'majority_vote', or 'best_of_n'
 
 def evaluation():
     parser = transformers.HfArgumentParser(DataArguments)
@@ -220,31 +225,78 @@ def evaluation():
             gt = inputs["masks"]
             inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
             inputs['token_refer_id'] = [ids.to(device) for ids in inputs['token_refer_id']]
-            if 'token_answer_id' in inputs:
-                inputs['token_answer_id'] = [ids.to(device) for ids in inputs['token_answer_id']]
-                outputs = model.eval_seg(
-                    input_ids=inputs['input_ids'],
-                    attention_mask=inputs['attention_mask'],
-                    images=inputs['images'].float(),
-                    masks=inputs['masks'],
-                    token_refer_id = inputs['token_refer_id'],
-                    refer_embedding_indices=inputs['refer_embedding_indices'],
-                    labels=inputs['labels'],
-                    token_answer_id=inputs['token_answer_id'],
-                    answer_embedding_indices=inputs['answer_embedding_indices']
-                    )
+            if getattr(data_args, 'scaling_type', None) is not None:
+                from segearth_r1.eval_and_test.inference_scaling import (
+                    parallel_scale_reasoning,
+                    sequential_scale_reasoning,
+                    parallel_scale_referring
+                )
+                outputs = []
+                # Process each item in the batch sequentially for ensembling
+                for b_idx in range(inputs['images'].shape[0]):
+                    image_tensor = inputs['images'][b_idx:b_idx+1]
+                    
+                    if data_args.scaling_type == "parallel_reasoning":
+                        # Decode the pre-tokenized target question back into text
+                        question_ids = inputs['token_refer_id'][b_idx]
+                        question = tokenizer.decode(question_ids, skip_special_tokens=True).strip()
+                        
+                        scaled_res = parallel_scale_reasoning(
+                            model, tokenizer, image_tensor, question,
+                            n=data_args.scaling_n, temperature=data_args.scaling_temp,
+                            aggregator=data_args.scaling_aggregator, device=device
+                        )
+                        # Format output to match the structure compute_metric expects
+                        outputs.append({"pred_masks": scaled_res["mask"].cuda(), "scores": None})
+                        
+                    elif data_args.scaling_type == "sequential_reasoning":
+                        question_ids = inputs['token_refer_id'][b_idx]
+                        question = tokenizer.decode(question_ids, skip_special_tokens=True).strip()
+                        
+                        scaled_res = sequential_scale_reasoning(
+                            model, tokenizer, image_tensor, question,
+                            max_rounds=data_args.scaling_n, temperature=data_args.scaling_temp,
+                            device=device
+                        )
+                        outputs.append({"pred_masks": scaled_res["mask"].cuda(), "scores": None})
+                        
+                    elif data_args.scaling_type == "parallel_referring":
+                        scaled_res = parallel_scale_referring(
+                            model, tokenizer, image_tensor,
+                            input_ids=inputs['input_ids'][b_idx:b_idx+1],
+                            attention_mask=inputs['attention_mask'][b_idx:b_idx+1],
+                            token_refer_id=[inputs['token_refer_id'][b_idx]],
+                            refer_embedding_indices=inputs['refer_embedding_indices'][b_idx:b_idx+1],
+                            labels=inputs['labels'][b_idx:b_idx+1],
+                            aggregator=data_args.scaling_aggregator
+                        )
+                        outputs.append({"pred_masks": scaled_res["mask"].cuda(), "scores": None})
             else:
-                outputs = model.eval_seg(
-                    input_ids=inputs['input_ids'],
-                    attention_mask=inputs['attention_mask'],
-                    images=inputs['images'].float(),
-                    masks=inputs['masks'],
-                    token_refer_id = inputs['token_refer_id'],
-                    refer_embedding_indices=inputs['refer_embedding_indices'],
-                    labels=inputs['labels'],
-                    token_answer_id=None,
-                    answer_embedding_indices=None
-                    )
+                if 'token_answer_id' in inputs:
+                    inputs['token_answer_id'] = [ids.to(device) for ids in inputs['token_answer_id']]
+                    outputs = model.eval_seg(
+                        input_ids=inputs['input_ids'],
+                        attention_mask=inputs['attention_mask'],
+                        images=inputs['images'].float(),
+                        masks=inputs['masks'],
+                        token_refer_id = inputs['token_refer_id'],
+                        refer_embedding_indices=inputs['refer_embedding_indices'],
+                        labels=inputs['labels'],
+                        token_answer_id=inputs['token_answer_id'],
+                        answer_embedding_indices=inputs['answer_embedding_indices']
+                        )
+                else:
+                    outputs = model.eval_seg(
+                        input_ids=inputs['input_ids'],
+                        attention_mask=inputs['attention_mask'],
+                        images=inputs['images'].float(),
+                        masks=inputs['masks'],
+                        token_refer_id = inputs['token_refer_id'],
+                        refer_embedding_indices=inputs['refer_embedding_indices'],
+                        labels=inputs['labels'],
+                        token_answer_id=None,
+                        answer_embedding_indices=None
+                        )
             # vis
             if data_args.vis_path is not None:
                 os.makedirs(data_args.vis_path, exist_ok=True)

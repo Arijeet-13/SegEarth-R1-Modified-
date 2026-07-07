@@ -1,0 +1,35 @@
+export DISABLE_ADDMM_CUDA_LT=1
+deepspeed --master_port 29500 --include localhost:0 segearth_r1/train/train.py \
+    --deepspeed ./scripts/zero2.json \
+    --data_path "your_data_path" \
+    --model_name_or_path "pre_trained/phi-1_5_dev" \
+    --vision_encoder_type "hiera" \
+    --vision_tower "path/to/hiera_base_pretrained.pth" \
+    --mask_config "segearth_r1/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml" \
+    --mm_vision_select_layer -2 \
+    --mm_use_im_start_end False \
+    --mm_use_im_patch_token False \
+    --output_dir ./checkpoint/SegEarth-R1_ReasonSeg \
+    --num_train_epochs 15 \
+    --per_device_train_batch_size 1 \
+    --per_device_eval_batch_size 2 \
+    --gradient_accumulation_steps 1 \
+    --evaluation_strategy "no" \
+    --save_strategy "epoch" \
+    --save_total_limit 2 \
+    --learning_rate 1e-4 \
+    --weight_decay 0. \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "cosine" \
+    --logging_steps 1 \
+    --model_max_length 2048 \
+    --gradient_checkpointing True \
+    --dataloader_num_workers 4 \
+    --lazy_preprocess True \
+    --report_to none \
+    --seg_task 'referring' \
+    --freeze_mm_mlp_adapter False \
+    --bf16 True \
+    --train_backbone False \
+    --mm_projector_type "SparseConv_1" \ # compession connector
+    --dataset_type 'EarthReason' \

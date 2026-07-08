@@ -460,7 +460,8 @@ class DataCollector(object):
         
         for data_dict in data_dicts:
             for key in ['input_ids', 'labels', 'image', 'mask']:
-                del data_dict[key]
+                if key in data_dict:
+                    del data_dict[key]
 
         if 'dataset_type' in data_dicts[0]:
             batch['dataset_type'] = [data_dict['dataset_type'] for data_dict in data_dicts]

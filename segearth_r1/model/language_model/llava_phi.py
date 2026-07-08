@@ -547,12 +547,17 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 # multimodal LLM, but the current sample is not multimodal
                 cur_input_embeds = self.get_model().embed_tokens(cur_input_ids)
                 # ensure gradients back propagation, not changing cur_input_embeds
-                cur_input_embeds = cur_input_embeds + (
-                        0. * self.get_model().mm_projector(vision_tower.dummy_feature)).sum()
+                dummy_feat = getattr(vision_tower, 'dummy_feature', None)
+                if dummy_feat is not None:
+                    cur_input_embeds = cur_input_embeds + (
+                            0. * self.get_model().mm_projector(dummy_feat)).sum()
                 new_input_embeds.append(cur_input_embeds)
                 if labels is not None:
                     new_labels.append(labels[batch_idx])
-                new_seg_query_masks.append(cur_seg_query_mask)
+                if new_seg_query_masks is not None:
+                    new_seg_query_masks.append(cur_seg_query_mask)
+                if new_refer_embedding_indices is not None:
+                    new_refer_embedding_indices.append(cur_refer_embedding_indices)
                 # cur_image_idx += 1
                 continue
 
@@ -915,7 +920,9 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 # multimodal LLM, but the current sample is not multimodal
                 cur_input_embeds = self.get_model().embed_tokens(cur_input_ids)
                 # ensure gradients back propagation, not changing cur_input_embeds
-                cur_input_embeds = cur_input_embeds + (0. * self.get_model().mm_projector(vision_tower.dummy_feature)).sum()
+                dummy_feat = getattr(vision_tower, 'dummy_feature', None)
+                if dummy_feat is not None:
+                    cur_input_embeds = cur_input_embeds + (0. * self.get_model().mm_projector(dummy_feat)).sum()
                 new_input_embeds.append(cur_input_embeds)
                 if labels is not None:
                     new_labels.append(labels[batch_idx])
@@ -1139,18 +1146,29 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 results = self.SEG_instance_inference(None, mask_pred_result.float())
             else:
                 results = self.SEG_instance_inference(SEG_cls_result.float(), mask_pred_result.float())
+            processed_results.append(results)
             
         return processed_results
 
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
-        print(f"[DEBUG gen] input_ids: {None if input_ids is None else list(input_ids.shape)}, past_key_values: {past_key_values is not None}")
         images = kwargs.get("images", None)
-        inputs = super().prepare_inputs_for_generation(
-            input_ids, past_key_values=past_key_values, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs
-        )
-        print(f"[DEBUG gen] returned inputs: {list(inputs.keys())}, input_ids: {None if inputs.get('input_ids') is None else list(inputs['input_ids'].shape)}")
+        if past_key_values is not None:
+            # Bypass base class prepare_inputs_for_generation to prevent length mismatch and incorrect slicing
+            past_len = past_key_values[0][0].shape[-2]
+            position_ids = torch.full((input_ids.shape[0], 1), past_len, dtype=torch.long, device=input_ids.device)
+            inputs = {
+                "input_ids": input_ids[:, -1:],
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        else:
+            inputs = super().prepare_inputs_for_generation(
+                input_ids, past_key_values=past_key_values, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs
+            )
         if images is not None:
             inputs['images'] = images
         return inputs

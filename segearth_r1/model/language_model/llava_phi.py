@@ -518,7 +518,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 1] == 1:
                 attention_mask = torch.ones((attention_mask.shape[0], past_key_values[-1][-1].shape[-2] + 1),
                                             dtype=attention_mask.dtype, device=attention_mask.device)
-            return input_ids, attention_mask, past_key_values, None, labels, seg_query_mask
+            return input_ids, attention_mask, past_key_values, None, labels, seg_query_mask, None
 
         if type(images) is list or images.ndim == 5:
             concat_images = torch.cat([image for image in images], dim=0)
@@ -738,7 +738,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             seg_query_mask = None
             input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.mm_conv_prepare_inputs_labels_for_multimodal(
                 input_ids, attention_mask, past_key_values, labels, images)
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -751,6 +751,16 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         ) 
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
+
+        # Early return for generation mode (no dataset_type → no segmentation)
+        if batch_dataset_type not in ['mm_conv', 'reason_seg', 'refer_seg']:
+            return CausalLMOutputWithPast(
+                loss=None,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
 
         loss = None
         if batch_dataset_type in ['mm_conv', 'reason_seg', 'refer_seg']: 
@@ -870,6 +880,14 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 loss_SEG_class=loss_SEG_class.detach(),
                 loss_llm=llm_loss.detach(),
             )
+        
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
         
     def mm_conv_prepare_inputs_labels_for_multimodal(
         self, input_ids, attention_mask, past_key_values, labels, images
@@ -1121,9 +1139,21 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 results = self.SEG_instance_inference(None, mask_pred_result.float())
             else:
                 results = self.SEG_instance_inference(SEG_cls_result.float(), mask_pred_result.float())
-            processed_results.append(results)
             
         return processed_results
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        print(f"[DEBUG gen] input_ids: {None if input_ids is None else list(input_ids.shape)}, past_key_values: {past_key_values is not None}")
+        images = kwargs.get("images", None)
+        inputs = super().prepare_inputs_for_generation(
+            input_ids, past_key_values=past_key_values, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs
+        )
+        print(f"[DEBUG gen] returned inputs: {list(inputs.keys())}, input_ids: {None if inputs.get('input_ids') is None else list(inputs['input_ids'].shape)}")
+        if images is not None:
+            inputs['images'] = images
+        return inputs
 
 AutoConfig.register("llava_phi", LlavaConfig)
 AutoModelForCausalLM.register(LlavaConfig, segearth_r1)

@@ -136,6 +136,9 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     dataloader_drop_last: bool = True
     post_training: bool = False
+    use_grpo: bool = field(default=False, metadata={"help": "Whether to use GRPO reinforcement learning instead of SFT."})
+    kl_coeff: float = field(default=0.01, metadata={"help": "KL divergence coefficient for GRPO."})
+    group_size: int = field(default=8, metadata={"help": "Group size (number of candidates sampled per prompt) for GRPO."})
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):

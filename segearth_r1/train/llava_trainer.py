@@ -1,7 +1,9 @@
 import os
 import torch
 import shutil
+import copy
 from transformers import Trainer
+from segearth_r1.eval_and_test.inference_scaling import _build_reasoning_item, PREFIX_INST, DataCollector
 from transformers.modeling_utils import unwrap_model
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 import torch.distributed as dist
@@ -182,51 +184,180 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 
 
 class LLaVATrainer(Trainer):
-    # def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
-    #     """
-    #     Perform a training step on a batch of inputs.
-    #
-    #     Subclass and override to inject custom behavior.
-    #
-    #     Args:
-    #         model (`nn.Module`):
-    #             The model to train.
-    #         inputs (`Dict[str, Union[torch.Tensor, Any]]`):
-    #             The inputs and targets of the model.
-    #
-    #             The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
-    #             argument `labels`. Check your model's documentation for all accepted arguments.
-    #
-    #     Return:
-    #         `torch.Tensor`: The tensor with training loss on this batch.
-    #     """
-    #     model.train()
-    #     inputs = self._prepare_inputs(inputs)
-    #     if dist.is_available():
-    #         dist.barrier()
-    #     import ipdb;ipdb.set_trace()
-    #     if hasattr(self.train_dataset,'cur_dataset_index'):
-    #         self.train_dataset.update_dataset_index()
-    #     print(self.train_dataset.cur_dataset_index)
-    #
-    #
-    #     if is_sagemaker_mp_enabled():
-    #         loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
-    #         return loss_mb.reduce_mean().detach().to(self.args.device)
-    #
-    #     with self.compute_loss_context_manager():
-    #         loss = self.compute_loss(model, inputs)
-    #
-    #     if self.args.n_gpu > 1:
-    #         loss = loss.mean()  # mean() to average on multi-gpu parallel training
-    #
-    #     if self.use_apex:
-    #         with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-    #             scaled_loss.backward()
-    #     else:
-    #         self.accelerator.backward(loss)
-    #
-    #     return loss.detach() / self.args.gradient_accumulation_steps
+    def compute_iou_reward(self, pred_mask, gt_mask):
+        """Task-driven outcome reward (Intersection over Union)."""
+        pred = (pred_mask > 0.5).float()
+        gt = (gt_mask > 0.5).float()
+        intersection = (pred * gt).sum()
+        union = pred.sum() + gt.sum() - intersection
+        return float(intersection / (union + 1e-8))
+
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        if not getattr(self.args, 'use_grpo', False):
+            return super().training_step(model, inputs)
+
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        # Initialize reference model if not done yet
+        if not hasattr(self, 'ref_model'):
+            try:
+                self.ref_model = copy.deepcopy(model)
+                self.ref_model.eval()
+                for p in self.ref_model.parameters():
+                    p.requires_grad = False
+            except Exception as e:
+                # Fallback if deepcopy is not supported (e.g. ZeRO-3)
+                self.ref_model = None
+
+        device = inputs['images'].device
+        batch_size = inputs['input_ids'].shape[0]
+        
+        # Accumulate and average the loss over the batch size to support batch_size > 1
+        accumulated_loss = 0.0
+        
+        for b_idx in range(batch_size):
+            input_ids = inputs['input_ids'][b_idx]
+            labels = inputs['labels'][b_idx]
+            
+            # Find prompt length: index of first non-ignore token
+            non_ignore_indices = (labels != -100).nonzero(as_tuple=True)[0]
+            if len(non_ignore_indices) > 0:
+                prompt_len = non_ignore_indices[0].item()
+            else:
+                prompt_len = len(labels)
+                
+            prompt_ids = input_ids[:prompt_len]
+            image_tensor = inputs['images'][b_idx:b_idx+1] # [1, 3, H, W]
+            gt_mask = inputs.get('masks', None)
+            if gt_mask is not None:
+                gt_mask = gt_mask[b_idx]
+
+            # Replicate input prompt and images to batch size G before generating
+            prompt_ids_batched = prompt_ids.unsqueeze(0).repeat(self.args.group_size, 1)
+            images_batched = image_tensor.repeat(self.args.group_size, 1, 1, 1)
+
+            # 1. Sample G candidate reasoning paths from active policy (no grads)
+            with self.compute_loss_context_manager():
+                with torch.no_grad():
+                    outputs = model.generate(
+                        input_ids=prompt_ids_batched,
+                        images=images_batched,
+                        do_sample=True,
+                        temperature=1.0,
+                        return_dict_in_generate=True,
+                    )
+
+            output_ids = outputs.sequences  # [G, total_len]
+            gen_ids = output_ids[:, prompt_ids.size(0):]  # [G, gen_len]
+            gen_len = gen_ids.shape[1]
+
+            # 2. Predict segmented masks for the group in parallel
+            # Decode candidates to construct proper referring segmentation items
+            question = self.tokenizer.decode(prompt_ids, skip_special_tokens=True).replace(PREFIX_INST, "").strip()
+            answer_texts = [self.tokenizer.decode(g, skip_special_tokens=True).strip() for g in gen_ids]
+
+            image_cpu = image_tensor.squeeze(0).cpu()
+            items = [_build_reasoning_item(image_cpu, question, ans, self.tokenizer) for ans in answer_texts]
+
+            # Collate items using DataCollector
+            batch = DataCollector(tokenizer=self.tokenizer)(items)
+            batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+            batch["token_refer_id"] = [t.to(device) for t in batch["token_refer_id"]]
+            batch["token_answer_id"] = [t.to(device) for t in batch["token_answer_id"]]
+
+            # Predict masks
+            with self.compute_loss_context_manager():
+                outputs_seg = model.eval_seg(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    images=batch["images"].float(),
+                    masks=None,
+                    token_refer_id=batch["token_refer_id"],
+                    refer_embedding_indices=batch["refer_embedding_indices"],
+                    labels=batch["labels"],
+                    token_answer_id=batch["token_answer_id"],
+                    answer_embedding_indices=batch["answer_embedding_indices"],
+                )
+
+            # Calculate rewards (IoU only)
+            group_rewards = []
+            for i, out in enumerate(outputs_seg):
+                pred = out["pred_masks"]
+                pred_mask = pred[0] if pred.dim() == 3 else pred
+                if gt_mask is not None:
+                    r_iou = self.compute_iou_reward(pred_mask, gt_mask)
+                else:
+                    r_iou = 0.0
+                group_rewards.append(r_iou)
+
+            with self.compute_loss_context_manager():
+                # 3. Log probabilities under active policy (GRADIENTS ENABLED - for policy loss)
+                new_logits = model(input_ids=output_ids, images=images_batched).logits
+                new_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1)
+                old_logp = new_logp.detach()
+
+                # 4. Log probabilities under reference policy (no gradient - for KL penalty)
+                with torch.no_grad():
+                    if self.ref_model is not None:
+                        ref_outputs = self.ref_model(input_ids=output_ids, images=images_batched)
+                    else:
+                        # PEFT/LoRA adapter disabling fallback for DeepSpeed compatibility
+                        if hasattr(model, 'disable_adapter'):
+                            with model.disable_adapter():
+                                ref_outputs = model(input_ids=output_ids, images=images_batched)
+                        else:
+                            ref_outputs = None
+
+                    if ref_outputs is not None:
+                        ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
+                        gen_slice = gen_ids.unsqueeze(-1)  # [G, gen_len, 1]
+                        ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_slice).squeeze(-1)  # [G, gen_len]
+                    else:
+                        ref_token_log_probs = old_logp
+
+            # 5. Calculate Group Relative Advantages (Local Normalization)
+            rewards_tensor = torch.tensor(group_rewards, dtype=torch.float, device=device)
+            mean_r = rewards_tensor.mean()
+            std_r = rewards_tensor.std() + 1e-8
+            advantages = ((rewards_tensor - mean_r) / std_r).unsqueeze(-1)  # [G, 1] to broadcast with gen_len
+
+            # 6. Compute GRPO Loss (Policy Loss + stable k3 KL Penalty)
+            # Ratio has active gradients through new_logp
+            ratio = torch.exp(new_logp - old_logp)
+
+            # Mask out padding tokens to prevent gradient distortion
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            gen_attention_mask = (gen_ids != pad_token_id).float()
+            denom = gen_attention_mask.sum(dim=-1).clamp(min=1.0)
+
+            # Policy objective
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 0.8, 1.2) * advantages
+            policy_loss = (-torch.min(surr1, surr2) * gen_attention_mask).sum(dim=-1) / denom  # [G]
+
+            # Stable k3 KL Divergence Penalty: exp(ref_log_prob - log_prob) - 1 - (ref_log_prob - log_prob)
+            log_ratio = ref_token_log_probs - new_logp
+            kl = torch.exp(log_ratio) - 1 - log_ratio
+            kl_loss = (self.args.kl_coeff * kl * gen_attention_mask).sum(dim=-1) / denom  # [G]
+
+            # Total loss averaged over group size
+            total_loss = (policy_loss + kl_loss).mean()
+            accumulated_loss += total_loss
+
+        # Explicit backward pass to update the active policy network
+        loss_to_backward = accumulated_loss / batch_size
+
+        if self.args.gradient_accumulation_steps > 1:
+            loss_to_backward = loss_to_backward / self.args.gradient_accumulation_steps
+
+        if self.use_apex:
+            with amp.scale_loss(loss_to_backward, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(loss_to_backward)
+
+        return loss_to_backward.detach()
 
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):

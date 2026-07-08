@@ -54,11 +54,15 @@ def sample_reasoning_answers(
     input_ids = tokenizer_image_token(
         prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
     ).unsqueeze(0).to(image_tensor.device)
+    attention_mask = torch.ones_like(input_ids)
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
     candidates = []
     for _ in range(n_samples):
         output_ids = model.generate(
             input_ids,
+            attention_mask=attention_mask,
+            pad_token_id=pad_token_id,
             images=image_tensor,
             do_sample=temperature > 0,
             temperature=max(temperature, 1e-5),

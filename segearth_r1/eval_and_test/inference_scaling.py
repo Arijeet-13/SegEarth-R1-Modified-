@@ -54,23 +54,28 @@ def sample_reasoning_answers(
     input_ids = tokenizer_image_token(
         prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
     ).unsqueeze(0).to(image_tensor.device)
-    attention_mask = torch.ones_like(input_ids)
+    
+    # Run all generations in parallel as a single batch pass
+    input_ids_batched = input_ids.repeat(n_samples, 1)
+    attention_mask_batched = torch.ones_like(input_ids_batched)
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    image_tensor_batched = image_tensor.repeat(n_samples, 1, 1, 1)
+
+    output_ids = model.generate(
+        input_ids_batched,
+        attention_mask=attention_mask_batched,
+        pad_token_id=pad_token_id,
+        images=image_tensor_batched,
+        do_sample=temperature > 0,
+        temperature=max(temperature, 1e-5),
+        top_p=top_p,
+        max_new_tokens=max_new_tokens,
+        use_cache=True,
+    )
 
     candidates = []
-    for _ in range(n_samples):
-        output_ids = model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            pad_token_id=pad_token_id,
-            images=image_tensor,
-            do_sample=temperature > 0,
-            temperature=max(temperature, 1e-5),
-            top_p=top_p,
-            max_new_tokens=max_new_tokens,
-            use_cache=True,
-        )
-        new_tokens = output_ids[0, input_ids.shape[1]:]
+    for i in range(n_samples):
+        new_tokens = output_ids[i, input_ids.shape[1]:]
         text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
         candidates.append({"text": text, "n_tokens": int(new_tokens.shape[0])})
     return candidates

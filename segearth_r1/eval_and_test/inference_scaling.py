@@ -297,44 +297,51 @@ def parallel_scale_referring(
     model,
     tokenizer,
     image_tensor: torch.Tensor,
-    inputs: dict,
+    inputs: Optional[dict] = None,
     n: int = 8,
     aggregator: str = "average",
     device="cuda",
     oracle_iou_fn: Optional[Callable[[torch.Tensor], float]] = None,
+    **kwargs
 ) -> dict:
+    if inputs is None:
+        inputs = kwargs
     candidates = []
     n_calls = 0
-
-    with torch.no_grad():
-        for i in range(n):
-            flipped = random.random() < 0.5
-            img = image_tensor.clone()
-            if flipped:
-                img = img.flip(-1)
-
-            out = model.eval_seg(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                images=img.float(),
-                masks=None,
-                token_refer_id=inputs["token_refer_id"],
-                refer_embedding_indices=inputs["refer_embedding_indices"],
-                labels=inputs["labels"],
-                token_answer_id=None,
-                answer_embedding_indices=None,
-            )[0]
-            n_calls += 1
-            pred = out["pred_masks"]
-            pred = pred[0] if pred.dim() == 3 else pred
-            pred = _flip_mask_back(pred, flipped)
-            candidates.append({"mask": pred.detach().float().cpu(), "score": _mask_confidence(out)})
-
+    for i in range(n):
+        flipped = random.random() < 0.5
+        img = image_tensor.clone()
+        if flipped:
+            img = img.flip(-1)
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+        token_refer_id = inputs["token_refer_id"]
+        refer_embedding_indices = inputs["refer_embedding_indices"]
+        labels = inputs["labels"]
+        out = model.eval_seg(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            images=img.float(),
+            masks=None,
+            token_refer_id=token_refer_id,
+            refer_embedding_indices=refer_embedding_indices,
+            labels=labels,
+            token_answer_id=None,
+            answer_embedding_indices=None,
+        )[0]
+        n_calls += 1
+        pred = out["pred_masks"]
+        pred = pred[0] if pred.dim() == 3 else pred
+        pred = _flip_mask_back(pred, flipped)
+        candidates.append({"mask": pred.detach().float().cpu(), "score": _mask_confidence(out)})
     agg_fn = _AGGREGATORS[aggregator]
     final_mask, agg_info = agg_fn(candidates, oracle_iou_fn=oracle_iou_fn)
     return {
-        "mask": final_mask, "n_calls": n_calls, "candidates": candidates,
-        "aggregator": aggregator, "aggregator_info": agg_info,
+        "mask": final_mask,
+        "n_calls": n_calls,
+        "candidates": candidates,
+        "aggregator": aggregator,
+        "aggregator_info": agg_info,
     }
 
 

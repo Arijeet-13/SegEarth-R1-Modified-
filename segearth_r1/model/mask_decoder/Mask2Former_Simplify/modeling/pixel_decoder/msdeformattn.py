@@ -266,6 +266,7 @@ class MSDeformAttnPixelDecoder(nn.Module): # MSDeformAttnPixelDecoder
         self.output_convs = output_convs[::-1]
 
     def forward_features(self, features): # features: {"res2": [batch_size, 128, H / 4 (128), W / 4 (128)], "res3": [batch_size, 256, H / 8 (64), W / 8 (64)], "res4": [batch_size, 512, H / 16 (32), W / 16 (32)], "res5": [batch_size, 1024, H / 32 (16), W / 32 (16)]}
+        features = {k: v.float() for k, v in features.items()}
         srcs = []
         pos = []
         # Reverse feature maps into top-down order (from low to high resolution), 'res5' -> 'res3'

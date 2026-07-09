@@ -16,13 +16,19 @@ arXiv:2504.00294) to geospatial pixel reasoning / referring segmentation:
 import torch
 import torch.nn.functional as F
 import random
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, Tuple, Dict
 from segearth_r1.constants import IMAGE_TOKEN_INDEX, REFER_TOKEN_INDEX, ANSWER_TOKEN_INDEX
 from segearth_r1.mm_utils import tokenizer_image_token
 from segearth_r1 import conversation as conversation_lib
 from segearth_r1.eval_and_test.eval_dataset.RS_val_dataset import preprocess_llama2, preprocess_referring_instruction, DataCollector
 
 PREFIX_INST = "This is an image <image>, Please doing Reasoning Segmentation according to the following instruction:"
+
+def _binarize(mask: torch.Tensor) -> torch.Tensor:
+    """Ensures consistent pixel-level binarization across all functions."""
+    if mask.min() >= 0.0 and mask.max() <= 1.0:
+        return (mask > 0.5).float()
+    return (mask > 0.0).float()
 
 @torch.no_grad()
 def sample_reasoning_answers(
@@ -36,17 +42,23 @@ def sample_reasoning_answers(
     max_new_tokens: int = 64,
     conv_version: str = "llava_phi",
     critique_prompt: Optional[str] = None,
+    history: Optional[List[Tuple[str, str]]] = None,
 ) -> List[dict]:
     """
     Stage 1 (reason): sample `n_samples` free-text candidate answers for the
-    same (image, question) pair at temperature > 0, exactly like the
-    "independent parallel generations" step in the paper
-    (Sec. 2, "parallel scaling method").
+    same (image, question) pair at temperature > 0. Supports threading conversation history.
     """
     conv = conversation_lib.conv_templates[conv_version].copy()
-    human_turn = f"{PREFIX_INST} {question}"
+    
+    # Inject conversation history turns
+    if history:
+        for role, content in history:
+            conv.append_message(role, content)
+            
+    human_turn = f"{PREFIX_INST} {question}" if not history else question
     if critique_prompt:
         human_turn += f"\n{critique_prompt}"
+        
     conv.append_message(conv.roles[0], human_turn)
     conv.append_message(conv.roles[1], None)
     prompt = conv.get_prompt()
@@ -124,6 +136,16 @@ def _mask_confidence(result: dict) -> float:
     scores = result.get("scores")
     if scores is not None and len(scores) > 0:
         return float(scores.flatten()[0])
+    
+    # Expose and use raw_masks logits if available
+    raw = result.get("raw_masks")
+    if raw is not None:
+        pred = raw[0] if raw.dim() == 3 else raw
+        fg = pred > 0
+        if fg.sum() == 0:
+            return 0.0
+        return float(pred.sigmoid()[fg].mean())
+
     pred = result["pred_masks"]
     pred = pred[0] if pred.dim() == 3 else pred
     fg = pred > 0
@@ -174,53 +196,53 @@ def predict_masks_given_answers(
         pred = pred[0] if pred.dim() == 3 else pred
         results.append({
             "text": text,
-            "mask": pred.detach().float().cpu(),   # binarized {0,1} HxW
+            "mask": _binarize(pred.detach().cpu()),   # consistently binarized {0,1} HxW
+            "raw_masks": out.get("raw_masks").cpu() if "raw_masks" in out else None,
             "score": _mask_confidence(out),
         })
     return results
 
 
 # --------------------------------------------------------------------------
-# Aggregators (mirrors the paper's "average / majority vote / best-of-n /
-# worst-of-n" operators, Sec. 2)
+# Aggregators
 # --------------------------------------------------------------------------
 def _stack(candidates: List[dict]) -> torch.Tensor:
     return torch.stack([c["mask"] for c in candidates])
 
 
-def aggregate_average(candidates: List[dict], threshold: float = 0.5) -> torch.Tensor:
+def aggregate_average(candidates: List[dict], threshold: float = 0.5, **kwargs) -> Tuple[torch.Tensor, dict]:
     avg = _stack(candidates).mean(0)
-    return (avg > threshold).float(), {"mean_conf": float(avg.mean())}
+    return _binarize(avg), {"mean_conf": float(avg.mean())}
 
 
-def aggregate_majority_vote(candidates: List[dict]) -> torch.Tensor:
-    binary = (_stack(candidates) > 0).float()
+def aggregate_majority_vote(candidates: List[dict], **kwargs) -> Tuple[torch.Tensor, dict]:
+    binary = _stack(candidates)
     vote = binary.mean(0)
     return (vote > 0.5).float(), {"agreement": float(vote.max())}
 
 
 def aggregate_best_of_n(
-    candidates: List[dict], oracle_iou_fn: Optional[Callable[[torch.Tensor], float]] = None
-) -> torch.Tensor:
+    candidates: List[dict], oracle_iou_fn: Optional[Callable[[torch.Tensor], float]] = None, **kwargs
+) -> Tuple[torch.Tensor, dict]:
     if oracle_iou_fn:
         scored = [(oracle_iou_fn(c["mask"]), c) for c in candidates]
     else:
         scored = [(c["score"], c) for c in candidates]
     scored.sort(key=lambda x: x[0], reverse=True)
     best = scored[0][1]
-    return (best["mask"] > 0).float(), {"best_score": scored[0][0]}
+    return best["mask"], {"best_score": scored[0][0]}
 
 
 def aggregate_worst_of_n(
-    candidates: List[dict], oracle_iou_fn: Optional[Callable[[torch.Tensor], float]] = None
-) -> torch.Tensor:
+    candidates: List[dict], oracle_iou_fn: Optional[Callable[[torch.Tensor], float]] = None, **kwargs
+) -> Tuple[torch.Tensor, dict]:
     if oracle_iou_fn:
         scored = [(oracle_iou_fn(c["mask"]), c) for c in candidates]
     else:
         scored = [(c["score"], c) for c in candidates]
     scored.sort(key=lambda x: x[0])
     worst = scored[0][1]
-    return (worst["mask"] > 0).float(), {"worst_score": scored[0][0]}
+    return worst["mask"], {"worst_score": scored[0][0]}
 
 
 _AGGREGATORS = {
@@ -271,18 +293,24 @@ def sequential_scale_reasoning(
     temperature: float = 0.7,
     device="cuda",
     oracle_iou_fn: Optional[Callable[[torch.Tensor], float]] = None,
+    conv_version: str = "llava_phi",
 ) -> dict:
     best_mask = None
     best_score = -1.0
+    
+    conv = conversation_lib.conv_templates[conv_version].copy()
+    history = []
 
     for r in range(max_rounds):
         critique = None if r == 0 else "Please reconsider your previous answer and provide a better one."
         answers = sample_reasoning_answers(
             model, tokenizer, image_tensor, question,
             n_samples=1, temperature=temperature, critique_prompt=critique,
+            history=history, conv_version=conv_version,
         )
+        ans_text = answers[0]["text"]
         cands = predict_masks_given_answers(
-            model, tokenizer, image_tensor, question, [answers[0]["text"]], device=device
+            model, tokenizer, image_tensor, question, [ans_text], device=device
         )
         c = cands[0]
 
@@ -290,9 +318,16 @@ def sequential_scale_reasoning(
         if score > best_score:
             best_score = score
             best_mask = c["mask"]
+            
+        # Record the conversation turns into history for the next iteration round
+        user_msg = f"{PREFIX_INST} {question}" if r == 0 else question
+        if critique:
+            user_msg += f"\n{critique}"
+        history.append((conv.roles[0], user_msg))
+        history.append((conv.roles[1], ans_text))
 
     return {
-        "mask": (best_mask > 0).float(),
+        "mask": best_mask,
         "n_calls": max_rounds,
         "best_score": best_score,
     }
@@ -311,57 +346,81 @@ def parallel_scale_referring(
     aggregator: str = "average",
     device="cuda",
     oracle_iou_fn: Optional[Callable[[torch.Tensor], float]] = None,
+    flip_prob: float = 0.0,
+    referring_text: Optional[str] = None,
     **kwargs
 ) -> dict:
     if inputs is None:
         inputs = kwargs
-    candidates = []
-    n_calls = 0
+
+    # Determine whether we can safely flip the image (avoid directional terms like left/right/east/west)
+    directional_words = ["left", "right", "east", "west", "top", "bottom", "north", "south", "upper", "lower"]
+    should_flip = False
+    if flip_prob > 0.0:
+        should_flip = True
+        if referring_text is not None:
+            text_lower = referring_text.lower()
+            if any(word in text_lower for word in directional_words):
+                should_flip = False
+
+    # Stacking inputs into batches to perform a single forward pass
+    input_ids = inputs["input_ids"].repeat(n, 1)
+    attention_mask = inputs["attention_mask"].repeat(n, 1)
+    refer_embedding_indices = inputs["refer_embedding_indices"].repeat(n, 1)
+    labels = inputs["labels"].repeat(n, 1) if inputs.get("labels") is not None else None
+    token_refer_id = inputs["token_refer_id"] * n
+
+    images_list = []
+    flipped_flags = []
     for i in range(n):
-        flipped = random.random() < 0.5
+        do_flip = should_flip and (random.random() < flip_prob)
         img = image_tensor.clone()
-        if flipped:
+        if do_flip:
             img = img.flip(-1)
-        input_ids = inputs["input_ids"]
-        attention_mask = inputs["attention_mask"]
-        token_refer_id = inputs["token_refer_id"]
-        refer_embedding_indices = inputs["refer_embedding_indices"]
-        labels = inputs["labels"]
-        out = model.eval_seg(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            images=img.float(),
-            masks=None,
-            token_refer_id=token_refer_id,
-            refer_embedding_indices=refer_embedding_indices,
-            labels=labels,
-            token_answer_id=None,
-            answer_embedding_indices=None,
-        )[0]
-        n_calls += 1
+        images_list.append(img)
+        flipped_flags.append(do_flip)
+
+    images_batched = torch.cat(images_list, dim=0) # [n, 3, H, W]
+
+    # Evaluate the batched candidates in a single pass
+    outputs = model.eval_seg(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        images=images_batched.float(),
+        masks=None,
+        token_refer_id=token_refer_id,
+        refer_embedding_indices=refer_embedding_indices,
+        labels=labels,
+        token_answer_id=None,
+        answer_embedding_indices=None,
+    )
+
+    candidates = []
+    for out, flipped in zip(outputs, flipped_flags):
         pred = out["pred_masks"]
         pred = pred[0] if pred.dim() == 3 else pred
         pred = _flip_mask_back(pred, flipped)
-        candidates.append({"mask": pred.detach().float().cpu(), "score": _mask_confidence(out)})
+        candidates.append({
+            "mask": _binarize(pred.detach().cpu()),
+            "raw_masks": out.get("raw_masks").cpu() if "raw_masks" in out else None,
+            "score": _mask_confidence(out),
+        })
+
     agg_fn = _AGGREGATORS[aggregator]
     final_mask, agg_info = agg_fn(candidates, oracle_iou_fn=oracle_iou_fn)
     return {
         "mask": final_mask,
-        "n_calls": n_calls,
+        "n_calls": n,
         "candidates": candidates,
         "aggregator": aggregator,
         "aggregator_info": agg_info,
     }
 
 
-# --------------------------------------------------------------------------
-# Convenience: IoU oracle for benchmarking (paper-style "perfect verifier")
-# --------------------------------------------------------------------------
 def make_iou_oracle(gt_mask: torch.Tensor) -> Callable[[torch.Tensor], float]:
     """Builds an `oracle_iou_fn(pred_mask) -> IoU` closure against a known
     ground-truth mask, for reproducing the paper's best-of-n / worst-of-n
-    upper- and lower-bound analysis (Sec. 2, Fig. 3/8) during evaluation.
-    Do NOT use this at real deployment time - there is no ground truth then."""
+    upper- and lower-bound analysis."""
     gt = (gt_mask > 0).float()
 
     def _iou(pred_mask: torch.Tensor) -> float:

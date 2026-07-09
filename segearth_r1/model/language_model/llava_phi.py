@@ -271,6 +271,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         scores = mask_scores_per_image * scores_per_image if SEG_cls else None
         return {
             "pred_masks": pred_masks,
+            "raw_masks": mask_pred,
             "scores": scores,
         }
     def encode_images(self, images):
@@ -817,6 +818,15 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             else:
                 SEG_embedding = None
                 
+            # Cast inputs of the predictor to match the predictor's parameter precision
+            predictor_dtype = next(self.predictor.parameters()).dtype if list(self.predictor.parameters()) else torch.float32
+            multi_scale_features = [f.to(dtype=predictor_dtype) for f in multi_scale_features]
+            mask_features = mask_features.to(dtype=predictor_dtype)
+            if seg_query is not None:
+                seg_query = seg_query.to(dtype=predictor_dtype)
+            if SEG_embedding is not None:
+                SEG_embedding = SEG_embedding.to(dtype=predictor_dtype)
+
             mask_outputs = self.predictor(
                     multi_scale_features, 
                     mask_features, 
@@ -1118,6 +1128,15 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         else:
             SEG_embedding = None
             
+        # Cast inputs of the predictor to match the predictor's parameter precision
+        predictor_dtype = next(self.predictor.parameters()).dtype if list(self.predictor.parameters()) else torch.float32
+        multi_scale_features = [f.to(dtype=predictor_dtype) for f in multi_scale_features]
+        mask_features = mask_features.to(dtype=predictor_dtype)
+        if seg_query is not None:
+            seg_query = seg_query.to(dtype=predictor_dtype)
+        if SEG_embedding is not None:
+            SEG_embedding = SEG_embedding.to(dtype=predictor_dtype)
+
         mask_outputs = self.predictor(
                 multi_scale_features, 
                 mask_features, 
@@ -1169,8 +1188,12 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             inputs = super().prepare_inputs_for_generation(
                 input_ids, past_key_values=past_key_values, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs
             )
-        if images is not None:
-            inputs['images'] = images
+        
+        # Propagate custom multimodal/referring segmentation kwargs to model inputs
+        for key in ["images", "token_refer_id", "token_answer_id", "refer_embedding_indices", "answer_embedding_indices"]:
+            val = kwargs.get(key, None)
+            if val is not None:
+                inputs[key] = val
         return inputs
 
 AutoConfig.register("llava_phi", LlavaConfig)

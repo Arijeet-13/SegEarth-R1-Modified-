@@ -192,6 +192,13 @@ class LLaVATrainer(Trainer):
         union = pred.sum() + gt.sum() - intersection
         return float(intersection / (union + 1e-8))
 
+    def compute_soft_iou_reward(self, pred_prob, gt_mask):
+        """Soft IoU reward using continuous sigmoid probabilities."""
+        gt = (gt_mask > 0.5).float()
+        intersection = (pred_prob * gt).sum()
+        union = pred_prob.sum() + gt.sum() - intersection
+        return float(intersection / (union + 1e-8))
+
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         if not getattr(self.args, 'use_grpo', False):
             return super().training_step(model, inputs)
@@ -237,12 +244,28 @@ class LLaVATrainer(Trainer):
             prompt_ids_batched = prompt_ids.unsqueeze(0).repeat(self.args.group_size, 1)
             images_batched = image_tensor.repeat(self.args.group_size, 1, 1, 1)
 
+            # Replicate refer token ID and embedding indices to support generation/forward calls
+            token_refer_id = inputs.get('token_refer_id', None)
+            if token_refer_id is not None:
+                token_refer_id_batched = [token_refer_id[b_idx]] * self.args.group_size
+            else:
+                token_refer_id_batched = None
+
+            refer_embedding_indices = inputs.get('refer_embedding_indices', None)
+            if refer_embedding_indices is not None:
+                prompt_ref_indices = refer_embedding_indices[b_idx][:prompt_len]
+                refer_embedding_indices_prompt_batched = prompt_ref_indices.unsqueeze(0).repeat(self.args.group_size, 1)
+            else:
+                refer_embedding_indices_prompt_batched = None
+
             # 1. Sample G candidate reasoning paths from active policy (no grads)
             with self.compute_loss_context_manager():
                 with torch.no_grad():
                     outputs = model.generate(
                         input_ids=prompt_ids_batched,
                         images=images_batched,
+                        token_refer_id=token_refer_id_batched,
+                        refer_embedding_indices=refer_embedding_indices_prompt_batched,
                         do_sample=True,
                         temperature=1.0,
                         return_dict_in_generate=True,
@@ -252,10 +275,10 @@ class LLaVATrainer(Trainer):
             gen_ids = output_ids[:, prompt_ids.size(0):]  # [G, gen_len]
             gen_len = gen_ids.shape[1]
 
-            # 2. Predict segmented masks for the group in parallel
-            # Decode candidates to construct proper referring segmentation items
-            question = self.tokenizer.decode(prompt_ids, skip_special_tokens=True).replace(PREFIX_INST, "").strip()
-            answer_texts = [self.tokenizer.decode(g, skip_special_tokens=True).strip() for g in gen_ids]
+            # Filter out negative placeholder token IDs (like -200 and -204) before decoding
+            clean_prompt_ids = prompt_ids[prompt_ids >= 0]
+            question = self.tokenizer.decode(clean_prompt_ids, skip_special_tokens=True).replace(PREFIX_INST, "").strip()
+            answer_texts = [self.tokenizer.decode(g[g >= 0], skip_special_tokens=True).strip() for g in gen_ids]
 
             image_cpu = image_tensor.squeeze(0).cpu()
             items = [_build_reasoning_item(image_cpu, question, ans, self.tokenizer) for ans in answer_texts]
@@ -271,7 +294,7 @@ class LLaVATrainer(Trainer):
                 outputs_seg = model.eval_seg(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
-                    images=batch["images"].float(),
+                    images=batch["images"].to(dtype=model.dtype),
                     masks=None,
                     token_refer_id=batch["token_refer_id"],
                     refer_embedding_indices=batch["refer_embedding_indices"],
@@ -280,32 +303,69 @@ class LLaVATrainer(Trainer):
                     answer_embedding_indices=batch["answer_embedding_indices"],
                 )
 
-            # Calculate rewards (IoU only)
+            # Calculate rewards (IoU only, using soft IoU fallback to avoid early cold-start zero advantages)
             group_rewards = []
             for i, out in enumerate(outputs_seg):
-                pred = out["pred_masks"]
-                pred_mask = pred[0] if pred.dim() == 3 else pred
-                if gt_mask is not None:
-                    r_iou = self.compute_iou_reward(pred_mask, gt_mask)
+                raw_mask = out.get("raw_masks", None)
+                if raw_mask is not None:
+                    pred_prob = raw_mask.sigmoid()
+                    pred_prob = pred_prob[0] if pred_prob.dim() == 3 else pred_prob
+                    pred_prob = pred_prob.to(device)
+                    if gt_mask is not None:
+                        r_iou = self.compute_soft_iou_reward(pred_prob, gt_mask)
+                    else:
+                        r_iou = 0.0
                 else:
-                    r_iou = 0.0
+                    pred = out["pred_masks"]
+                    pred_mask = pred[0] if pred.dim() == 3 else pred
+                    if gt_mask is not None:
+                        r_iou = self.compute_iou_reward(pred_mask, gt_mask)
+                    else:
+                        r_iou = 0.0
                 group_rewards.append(r_iou)
+
+            # Debug rewards logging
+            rewards_tensor = torch.tensor(group_rewards, dtype=torch.float, device=device)
+            print(f"[GRPO debug] rewards={['%.6f' % r for r in group_rewards]}  mean={rewards_tensor.mean().item():.6f}  std={rewards_tensor.std().item():.6f}")
+
+            # Replicate refer embedding indices for the full output sequence (prompt + generation)
+            if refer_embedding_indices is not None:
+                gen_ref_indices = torch.zeros(gen_len, dtype=prompt_ref_indices.dtype, device=prompt_ref_indices.device)
+                full_ref_indices = torch.cat([prompt_ref_indices, gen_ref_indices], dim=0)
+                refer_embedding_indices_full_batched = full_ref_indices.unsqueeze(0).repeat(self.args.group_size, 1)
+            else:
+                refer_embedding_indices_full_batched = None
 
             with self.compute_loss_context_manager():
                 # 3. Log probabilities under active policy (GRADIENTS ENABLED - for policy loss)
-                new_logits = model(input_ids=output_ids, images=images_batched).logits
+                new_logits = model(
+                    input_ids=output_ids, 
+                    images=images_batched,
+                    token_refer_id=token_refer_id_batched,
+                    refer_embedding_indices=refer_embedding_indices_full_batched
+                ).logits
                 new_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1)
                 old_logp = new_logp.detach()
 
                 # 4. Log probabilities under reference policy (no gradient - for KL penalty)
                 with torch.no_grad():
                     if self.ref_model is not None:
-                        ref_outputs = self.ref_model(input_ids=output_ids, images=images_batched)
+                        ref_outputs = self.ref_model(
+                            input_ids=output_ids, 
+                            images=images_batched,
+                            token_refer_id=token_refer_id_batched,
+                            refer_embedding_indices=refer_embedding_indices_full_batched
+                        )
                     else:
                         # PEFT/LoRA adapter disabling fallback for DeepSpeed compatibility
                         if hasattr(model, 'disable_adapter'):
                             with model.disable_adapter():
-                                ref_outputs = model(input_ids=output_ids, images=images_batched)
+                                ref_outputs = model(
+                                    input_ids=output_ids, 
+                                    images=images_batched,
+                                    token_refer_id=token_refer_id_batched,
+                                    refer_embedding_indices=refer_embedding_indices_full_batched
+                                )
                         else:
                             ref_outputs = None
 

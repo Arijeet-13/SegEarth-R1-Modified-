@@ -460,6 +460,9 @@ def train():
     tokenizer.add_tokens("[SEG]") 
     model.resize_token_embeddings(len(tokenizer))
     model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
+    model.to(dtype=compute_dtype)
+    model.pixel_decoder.to(dtype=torch.float32)
+    model.predictor.to(dtype=torch.float32)
     data_module = make_unify_datamodule(tokenizer=tokenizer, data_args=data_args, training_args=training_args) 
     training_args.dataloader_drop_last = True
     trainer = LLaVATrainer(model=model,

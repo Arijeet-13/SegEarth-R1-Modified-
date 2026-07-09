@@ -15,6 +15,7 @@
 #    limitations under the License.
 
 from train_dataset import *
+from segearth_r1.train.llava_trainer import LLaVATrainer
 from segearth_r1.train.liss4_train_dataset import Liss4ReasonSegDataset
 
 from segearth_r1.mask_config.config import Config
@@ -33,7 +34,18 @@ def print_trainable_parm(model,prefix):
                 print(f'{prefix}:  {name}')
                 print_flag = True
                 break
+def resolve_config_path(path):
+    if path is not None and (path.startswith('./segearth_r1/') or path.startswith('segearth_r1/')):
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
+        rel_path = path[2:] if path.startswith('./') else path
+        resolved = os.path.join(repo_root, rel_path)
+        if os.path.exists(resolved):
+            return resolved
+    return path
+
 def get_mask_config(config='./segearth_r1/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml'):
+    config = resolve_config_path(config)
     cfg_coco = Config.fromfile(config) 
     cfg_base = CfgNode.load_yaml_with_base(config, allow_unsafe=True) 
     cfg_base.update(cfg_coco.__dict__.items())

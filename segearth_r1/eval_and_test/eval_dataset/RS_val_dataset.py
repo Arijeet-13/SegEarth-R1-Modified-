@@ -19,7 +19,6 @@ import transformers
 from segearth_r1.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, \
     DEFAULT_IM_END_TOKEN, DEFAULT_SEG_TOKEN, SEG_TOKEN_INDEX , REFER_TOKEN_INDEX, ANSWER_TOKEN_INDEX
 from torch.utils.data import Dataset
-from segearth_r1.train.llava_trainer import LLaVATrainer
 
 from segearth_r1 import conversation as conversation_lib
 from segearth_r1.model import *

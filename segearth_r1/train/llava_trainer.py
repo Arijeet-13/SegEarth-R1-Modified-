@@ -214,7 +214,7 @@ class LLaVATrainer(Trainer):
                 for p in self.ref_model.parameters():
                     p.requires_grad = False
             except Exception as e:
-                # Fallback if deepcopy is not supported (e.g. ZeRO-3)
+                # Fallback if deepcopy is not supported (e.g. ZeRO-3 or OOM)
                 self.ref_model = None
 
         device = inputs['images'].device
@@ -259,10 +259,12 @@ class LLaVATrainer(Trainer):
                 refer_embedding_indices_prompt_batched = None
 
             # 1. Sample G candidate reasoning paths from active policy (no grads)
+            attention_mask_batched = torch.ones_like(prompt_ids_batched)
             with self.compute_loss_context_manager():
                 with torch.no_grad():
                     outputs = model.generate(
                         input_ids=prompt_ids_batched,
+                        attention_mask=attention_mask_batched,
                         images=images_batched,
                         token_refer_id=token_refer_id_batched,
                         refer_embedding_indices=refer_embedding_indices_prompt_batched,
@@ -274,6 +276,9 @@ class LLaVATrainer(Trainer):
             output_ids = outputs.sequences  # [G, total_len]
             gen_ids = output_ids[:, prompt_ids.size(0):]  # [G, gen_len]
             gen_len = gen_ids.shape[1]
+
+            # Clear CUDA cache to free up generation activations
+            torch.cuda.empty_cache()
 
             # Filter out negative placeholder token IDs (like -200 and -204) before decoding
             clean_prompt_ids = prompt_ids[prompt_ids >= 0]
@@ -291,17 +296,20 @@ class LLaVATrainer(Trainer):
 
             # Predict masks
             with self.compute_loss_context_manager():
-                outputs_seg = model.eval_seg(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    images=batch["images"].to(dtype=model.dtype),
-                    masks=None,
-                    token_refer_id=batch["token_refer_id"],
-                    refer_embedding_indices=batch["refer_embedding_indices"],
-                    labels=batch["labels"],
-                    token_answer_id=batch["token_answer_id"],
-                    answer_embedding_indices=batch["answer_embedding_indices"],
-                )
+                with torch.no_grad():
+                    outputs_seg = model.eval_seg(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        images=batch["images"].to(dtype=model.dtype),
+                        masks=None,
+                        token_refer_id=batch["token_refer_id"],
+                        refer_embedding_indices=batch["refer_embedding_indices"],
+                        labels=batch["labels"],
+                        token_answer_id=batch["token_answer_id"],
+                        answer_embedding_indices=batch["answer_embedding_indices"],
+                    )
+            # Clear CUDA cache after mask prediction
+            torch.cuda.empty_cache()
 
             # Calculate rewards (IoU only, using soft IoU fallback to avoid early cold-start zero advantages)
             group_rewards = []

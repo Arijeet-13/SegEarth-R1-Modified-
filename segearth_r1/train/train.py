@@ -420,6 +420,9 @@ def train():
             tokenizer=tokenizer,
             model=model,
         )
+    model.config.pad_token_id = tokenizer.pad_token_id
+    if hasattr(model, 'generation_config') and model.generation_config is not None:
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
     if model_args.version in conversation_lib.conv_templates:
         conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
     else:

@@ -322,7 +322,7 @@ class LLaVATrainer(Trainer):
                 _had_forward_override = 'forward' in self.model.__dict__
                 _prev_forward = self.model.__dict__.get('forward', None)
                 self.model.forward = types.MethodType(type(self.model).forward, self.model)
-                images_batched = images_batched.to(dtype=next(self.model.parameters()).dtype)
+                images_batched = images_batched.to(dtype=next(self.model.get_model().get_vision_tower().parameters()).dtype)
                 try:
                     outputs = self.model.generate(
                         input_ids=prompt_ids_batched,

@@ -284,6 +284,7 @@ class LLaVATrainer(Trainer):
             for inputs in train_dl:
                 inputs = self._prepare_inputs(inputs)
                 rollout = self._collect_rollout(inputs)
+                print(f"[mem] after rollout: allocated={torch.cuda.memory_allocated()/1e9:.2f}GB reserved={torch.cuda.memory_reserved()/1e9:.2f}GB")
                 if rollout is None:
                     continue
                 for ep in range(ppo_epochs):
@@ -305,6 +306,7 @@ class LLaVATrainer(Trainer):
                 del rollout
                 gc.collect()
                 torch.cuda.empty_cache()
+                print(f"[mem] after ppo epochs: allocated={torch.cuda.memory_allocated()/1e9:.2f}GB reserved={torch.cuda.memory_reserved()/1e9:.2f}GB")
                 if self.control.should_save or (self.args.save_strategy == "steps" and self.args.save_steps > 0
                                                  and self.state.global_step % self.args.save_steps == 0):
                     self._save_checkpoint(self.model, trial=None)

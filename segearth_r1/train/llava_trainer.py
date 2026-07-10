@@ -327,7 +327,7 @@ class LLaVATrainer(Trainer):
                             token_refer_id=token_refer_id_batched,
                             refer_embedding_indices=refer_embedding_indices_prompt_batched,
                             do_sample=True,
-                            temperature=1.0,
+                            temperature=getattr(self.args, "grpo_temperature", 1.0),
                             max_new_tokens=64,
                             return_dict_in_generate=True,
                         )
@@ -408,7 +408,7 @@ class LLaVATrainer(Trainer):
                 rewards_tensor = torch.tensor(group_rewards, dtype=torch.float, device=device)
                 mean_r = rewards_tensor.mean()
                 std_r = rewards_tensor.std()
-                print(f"[GRPO debug] batch_idx={b_idx} rewards={['%.6f' % r for r in group_rewards]}  mean={mean_r.item():.6f}  std={std_r.item():.6f}")
+                print(f"[GRPO debug] batch_idx={b_idx} answers={answer_texts} rewards={['%.6f' % r for r in group_rewards]}  mean={mean_r.item():.6f}  std={std_r.item():.6f}")
 
                 if std_r < 1e-4:
                     print(f"[GRPO debug] near-zero reward variance (std={std_r:.6f}); skipping this example")

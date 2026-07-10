@@ -152,6 +152,7 @@ class TrainingArguments(transformers.TrainingArguments):
     kl_coeff: float = field(default=0.01, metadata={"help": "KL divergence coefficient for GRPO."})
     group_size: int = field(default=4, metadata={"help": "Group size (number of candidates sampled per prompt) for GRPO."})
     grpo_inner_epochs: int = field(default=2, metadata={"help": "Number of inner PPO/GRPO epochs per rollout step."})
+    grpo_temperature: float = field(default=1.0, metadata={"help": "Sampling temperature for GRPO rollouts."})
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):

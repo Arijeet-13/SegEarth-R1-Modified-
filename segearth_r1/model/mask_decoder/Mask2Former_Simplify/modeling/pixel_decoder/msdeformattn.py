@@ -266,6 +266,7 @@ class MSDeformAttnPixelDecoder(nn.Module): # MSDeformAttnPixelDecoder
         self.output_convs = output_convs[::-1]
 
     def forward_features(self, features): # features: {"res2": [batch_size, 128, H / 4 (128), W / 4 (128)], "res3": [batch_size, 256, H / 8 (64), W / 8 (64)], "res4": [batch_size, 512, H / 16 (32), W / 16 (32)], "res5": [batch_size, 1024, H / 32 (16), W / 32 (16)]}
+        transformer_dtype = next(self.transformer.parameters()).dtype if list(self.transformer.parameters()) else torch.float32
         srcs = []
         pos = []
         # Reverse feature maps into top-down order (from low to high resolution), 'res5' -> 'res3'
@@ -275,8 +276,8 @@ class MSDeformAttnPixelDecoder(nn.Module): # MSDeformAttnPixelDecoder
             proj_dtype = proj.weight.dtype if hasattr(proj, "weight") else x.dtype
             x = x.to(dtype=proj_dtype)
             proj_out = proj(x)
-            srcs.append(proj_out.float())
-            pos.append(self.pe_layer(x).float())
+            srcs.append(proj_out.to(dtype=transformer_dtype))
+            pos.append(self.pe_layer(x).to(dtype=transformer_dtype))
         # srcs: [[batch_size, 256, 32, 32], [batch_size, 256, 64, 64], [batch_size, 256, 128, 128]] pos: [[batch_size, 256, 32, 32], [batch_size, 256, 64, 64], [batch_size, 256, 128, 128]] pos和scrs的形状相同
         y, spatial_shapes, level_start_index = self.transformer(srcs, pos) # 后三层
         bs = y.shape[0]

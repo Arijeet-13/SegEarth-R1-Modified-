@@ -302,6 +302,9 @@ class LLaVATrainer(Trainer):
                                 "learning_rate": self.optimizer.param_groups[0]['lr'] if self.optimizer else self.args.learning_rate}
                         self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
                         self.log(logs)
+                del rollout
+                gc.collect()
+                torch.cuda.empty_cache()
                 if self.control.should_save or (self.args.save_strategy == "steps" and self.args.save_steps > 0
                                                  and self.state.global_step % self.args.save_steps == 0):
                     self._save_checkpoint(self.model, trial=None)
@@ -452,7 +455,7 @@ class LLaVATrainer(Trainer):
                 # Debug rewards logging
                 rewards_tensor = torch.tensor(group_rewards, dtype=torch.float, device=device)
                 mean_r = rewards_tensor.mean()
-                std_r = rewards_tensor.std()
+                std_r = rewards_tensor.std() if rewards_tensor.numel() > 1 else torch.tensor(0.0, device=device)
                 print(f"[GRPO debug] batch_idx={b_idx} answers={answer_texts} rewards={['%.6f' % r for r in group_rewards]}  mean={mean_r.item():.6f}  std={std_r.item():.6f}")
 
                 if std_r < 1e-4:

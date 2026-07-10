@@ -73,17 +73,24 @@ def sample_reasoning_answers(
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     image_tensor_batched = image_tensor.repeat(n_samples, 1, 1, 1)
 
-    output_ids = model.generate(
-        input_ids_batched,
-        attention_mask=attention_mask_batched,
-        pad_token_id=pad_token_id,
-        images=image_tensor_batched,
-        do_sample=temperature > 0,
-        temperature=max(temperature, 1e-5),
-        top_p=top_p,
-        max_new_tokens=max_new_tokens,
-        use_cache=True,
-    )
+    chunk = 4
+    all_ids = []
+    for i in range(0, n_samples, chunk):
+        g = min(chunk, n_samples - i)
+        out = model.generate(
+            input_ids_batched[i:i+g],
+            attention_mask=attention_mask_batched[i:i+g],
+            pad_token_id=pad_token_id,
+            images=image_tensor_batched[i:i+g],
+            do_sample=temperature > 0,
+            temperature=max(temperature, 1e-5),
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
+            use_cache=True,
+        )
+        all_ids.append(out)
+        torch.cuda.empty_cache()
+    output_ids = torch.cat(all_ids, dim=0)
 
     candidates = []
     for i in range(n_samples):
@@ -236,6 +243,8 @@ def aggregate_best_of_n(
     else:
         scored = [(c["score"], c) for c in candidates]
     scored.sort(key=lambda x: x[0], reverse=True)
+    if scored[0][0] <= 1e-6:
+        print("[best_of_n] all candidates scored ~0 — degenerate batch")
     best = scored[0][1]
     return best["mask"], {"best_score": scored[0][0]}
 

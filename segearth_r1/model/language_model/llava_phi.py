@@ -286,6 +286,11 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         }
     def encode_images(self, images):
         raw_features = self.run_vision_tower(images)
+        proj_dtype = next(self.get_model().mm_projector.parameters()).dtype
+        if isinstance(raw_features, (list, tuple)):
+            raw_features = tuple(f.to(dtype=proj_dtype) for f in raw_features)
+        else:
+            raw_features = raw_features.to(dtype=proj_dtype)
         image_features = self.get_model().mm_projector(raw_features)
         return image_features
 

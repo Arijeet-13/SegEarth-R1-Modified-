@@ -237,17 +237,16 @@ class LLaVATrainer(Trainer):
                 self.ref_model = None
                 print(f"[GRPO] WARNING: ref_model deepcopy failed ({e}); KL penalty disabled this run.")
 
-        device = self.args.device
-
+        self.control = self.callback_handler.on_train_begin(self.args, self.state, self.control)
         for epoch in range(int(self.args.num_train_epochs)):
             for inputs in train_dl:
                 inputs = self._prepare_inputs(inputs)
-                rollout = self._collect_rollout(inputs)      # no_grad: gen, reward, advantage, old_logp, ref_logp
-                if rollout is None:                          # zero-variance skip
+                rollout = self._collect_rollout(inputs)
+                if rollout is None:
                     continue
                 for ep in range(ppo_epochs):
                     self.model.train()
-                    loss = self._grpo_loss(rollout)           # grad-enabled: new_logp, ratio, surrogate, KL
+                    loss = self._grpo_loss(rollout)
                     if self.args.gradient_accumulation_steps > 1:
                         loss = loss / self.args.gradient_accumulation_steps
                     self.accelerator.backward(loss)
@@ -257,16 +256,24 @@ class LLaVATrainer(Trainer):
                         self.lr_scheduler.step()
                     self.optimizer.zero_grad()
                     self.state.global_step += 1
-                    
+                    self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
                     if self.state.global_step % self.args.logging_steps == 0:
-                        self.log({"grpo_loss": loss.item(), "ppo_epoch": ep, "learning_rate": self.optimizer.param_groups[0]['lr'] if self.optimizer else self.args.learning_rate})
-                
-                if self.args.save_strategy == "steps" and self.args.save_steps > 0 and self.state.global_step % self.args.save_steps == 0:
+                        self.control = self.callback_handler.on_log(self.args, self.state, self.control)
+                        self.log({"grpo_loss": loss.item(), "ppo_epoch": ep,
+                                  "learning_rate": self.optimizer.param_groups[0]['lr'] if self.optimizer else self.args.learning_rate})
+                if self.control.should_save or (self.args.save_strategy == "steps" and self.args.save_steps > 0
+                                                 and self.state.global_step % self.args.save_steps == 0):
                     self._save_checkpoint(self.model, trial=None)
-            
+                    self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+                if self.control.should_training_stop:
+                    break
+            self.state.epoch = epoch + 1
+            self.control = self.callback_handler.on_epoch_end(self.args, self.state, self.control)
             if self.args.save_strategy == "epoch":
                 self._save_checkpoint(self.model, trial=None)
-                
+            if self.control.should_training_stop:
+                break
+        self.control = self.callback_handler.on_train_end(self.args, self.state, self.control)
         self.save_state()
 
     def _collect_rollout(self, inputs) -> Optional[List[dict]]:
@@ -282,7 +289,8 @@ class LLaVATrainer(Trainer):
                 labels = inputs['labels'][b_idx]
                 
                 # Find prompt length: index of first non-ignore token
-                prompt_len = int(labels.ne(-100).sum())
+                non_ignore = (labels != -100).nonzero(as_tuple=True)[0]
+                prompt_len = non_ignore[0].item() if len(non_ignore) > 0 else len(labels)
                 prompt_ids = input_ids[:prompt_len]
                 
                 # We replicate prompt G times for the group

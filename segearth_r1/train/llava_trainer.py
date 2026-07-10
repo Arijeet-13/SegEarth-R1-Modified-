@@ -317,18 +317,28 @@ class LLaVATrainer(Trainer):
                     refer_embedding_indices_prompt_batched = None
 
             # 1. Sample G candidate reasoning paths from active policy (no grads)
+                import types
                 attention_mask_batched = torch.ones_like(prompt_ids_batched)
-                outputs = self.accelerator.unwrap_model(self.model, keep_fp32_wrapper=False).generate(
-                    input_ids=prompt_ids_batched,
-                    attention_mask=attention_mask_batched,
-                    images=images_batched,
-                    token_refer_id=token_refer_id_batched,
-                    refer_embedding_indices=refer_embedding_indices_prompt_batched,
-                    do_sample=True,
-                    temperature=1.0,
-                    max_new_tokens=64,
-                    return_dict_in_generate=True,
-                )
+                _had_forward_override = 'forward' in self.model.__dict__
+                _prev_forward = self.model.__dict__.get('forward', None)
+                self.model.forward = types.MethodType(type(self.model).forward, self.model)
+                try:
+                    outputs = self.model.generate(
+                        input_ids=prompt_ids_batched,
+                        attention_mask=attention_mask_batched,
+                        images=images_batched,
+                        token_refer_id=token_refer_id_batched,
+                        refer_embedding_indices=refer_embedding_indices_prompt_batched,
+                        do_sample=True,
+                        temperature=1.0,
+                        max_new_tokens=64,
+                        return_dict_in_generate=True,
+                    )
+                finally:
+                    if _had_forward_override:
+                        self.model.forward = _prev_forward
+                    else:
+                        del self.model.forward
 
                 output_ids = outputs.sequences  # [G, total_len]
 

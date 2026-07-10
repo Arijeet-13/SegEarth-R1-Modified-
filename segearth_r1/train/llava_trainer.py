@@ -210,6 +210,13 @@ class LLaVATrainer(Trainer):
         ppo_epochs = getattr(self.args, "grpo_inner_epochs", 2)
         num_steps = len(train_dl) * int(self.args.num_train_epochs) * ppo_epochs
         
+        if not hasattr(self, 'ref_model'):
+            self.ref_model = copy.deepcopy(self.model)
+            self.ref_model.eval()
+            for p in self.ref_model.parameters():
+                p.requires_grad = False
+            self.ref_model.to(self.args.device)
+
         self.create_optimizer_and_scheduler(num_training_steps=num_steps)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self.state.global_step = 0
@@ -227,16 +234,6 @@ class LLaVATrainer(Trainer):
                 if os.path.exists(sch_path) and self.lr_scheduler is not None:
                     self.lr_scheduler.load_state_dict(torch.load(sch_path, map_location="cpu"))
 
-        if not hasattr(self, 'ref_model'):
-            try:
-                self.ref_model = copy.deepcopy(self.model)
-                self.ref_model.eval()
-                for p in self.ref_model.parameters():
-                    p.requires_grad = False
-            except Exception as e:
-                self.ref_model = None
-                print(f"[GRPO] WARNING: ref_model deepcopy failed ({e}); KL penalty disabled this run.")
-
         self.control = self.callback_handler.on_train_begin(self.args, self.state, self.control)
         for epoch in range(int(self.args.num_train_epochs)):
             for inputs in train_dl:
@@ -247,8 +244,6 @@ class LLaVATrainer(Trainer):
                 for ep in range(ppo_epochs):
                     self.model.train()
                     loss = self._grpo_loss(rollout)
-                    if self.args.gradient_accumulation_steps > 1:
-                        loss = loss / self.args.gradient_accumulation_steps
                     self.accelerator.backward(loss)
                     self.accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
                     self.optimizer.step()
@@ -325,6 +320,7 @@ class LLaVATrainer(Trainer):
                         refer_embedding_indices=refer_embedding_indices_prompt_batched,
                         do_sample=True,
                         temperature=1.0,
+                        max_new_tokens=64,
                         return_dict_in_generate=True,
                     )
 
@@ -422,32 +418,14 @@ class LLaVATrainer(Trainer):
 
                 # Log probabilities under reference policy (no gradient - for KL penalty)
                 with self.compute_loss_context_manager():
-                    if self.ref_model is not None:
-                        ref_outputs = self.ref_model(
-                            input_ids=output_ids, 
-                            images=images_batched,
-                            token_refer_id=token_refer_id_batched,
-                            refer_embedding_indices=refer_embedding_indices_full_batched
-                        )
-                    else:
-                        # PEFT/LoRA adapter disabling fallback for DeepSpeed compatibility
-                        if hasattr(self.model, 'disable_adapter'):
-                            with self.model.disable_adapter():
-                                ref_outputs = self.model(
-                                    input_ids=output_ids, 
-                                    images=images_batched,
-                                    token_refer_id=token_refer_id_batched,
-                                    refer_embedding_indices=refer_embedding_indices_full_batched
-                                )
-                        else:
-                            ref_outputs = None
-
-                if ref_outputs is not None:
-                    ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
-                    gen_slice = gen_ids.unsqueeze(-1)  # [G, gen_len, 1]
-                    ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_slice).squeeze(-1)  # [G, gen_len]
-                else:
-                    ref_token_log_probs = old_logp
+                    ref_outputs = self.ref_model(
+                        input_ids=output_ids, 
+                        images=images_batched,
+                        token_refer_id=token_refer_id_batched,
+                        refer_embedding_indices=refer_embedding_indices_full_batched
+                    )
+                ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
+                ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1)
 
                 rollouts.append({
                     "output_ids": output_ids,

@@ -318,7 +318,7 @@ class LLaVATrainer(Trainer):
 
             # 1. Sample G candidate reasoning paths from active policy (no grads)
                 attention_mask_batched = torch.ones_like(prompt_ids_batched)
-                outputs = unwrap_model(self.model).generate(
+                outputs = self.accelerator.unwrap_model(self.model, keep_fp32_wrapper=False).generate(
                     input_ids=prompt_ids_batched,
                     attention_mask=attention_mask_batched,
                     images=images_batched,

@@ -214,8 +214,8 @@ class LLaVATrainer(Trainer):
                 for p in self.ref_model.parameters():
                     p.requires_grad = False
             except Exception as e:
-                # Fallback if deepcopy is not supported (e.g. ZeRO-3 or OOM)
                 self.ref_model = None
+                print(f"[GRPO] WARNING: ref_model deepcopy failed ({e}); KL penalty disabled this run.")
 
         device = inputs['images'].device
         batch_size = inputs['input_ids'].shape[0]
@@ -344,18 +344,28 @@ class LLaVATrainer(Trainer):
             else:
                 refer_embedding_indices_full_batched = None
 
-            with self.compute_loss_context_manager():
-                # 3. Log probabilities under active policy (GRADIENTS ENABLED - for policy loss)
-                new_logits = model(
-                    input_ids=output_ids, 
-                    images=images_batched,
-                    token_refer_id=token_refer_id_batched,
-                    refer_embedding_indices=refer_embedding_indices_full_batched
-                ).logits
-                new_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1)
-                old_logp = new_logp.detach()
+            # Calculate standard deviation and z-score advantages
+            rewards_tensor = torch.tensor(group_rewards, dtype=torch.float, device=device)
+            mean_r = rewards_tensor.mean()
+            std_r = rewards_tensor.std()
+            if std_r < 1e-4:
+                print(f"[GRPO debug] near-zero reward variance (std={std_r:.6f}); skipping this example")
+                continue
+            advantages = ((rewards_tensor - mean_r) / (std_r + 1e-8)).unsqueeze(-1)  # [G, 1] to broadcast with gen_len
 
-                # 4. Log probabilities under reference policy (no gradient - for KL penalty)
+            # 3. Log probabilities under initial active policy (no gradient - baseline for ratio)
+            with self.compute_loss_context_manager():
+                with torch.no_grad():
+                    new_logits = model(
+                        input_ids=output_ids, 
+                        images=images_batched,
+                        token_refer_id=token_refer_id_batched,
+                        refer_embedding_indices=refer_embedding_indices_full_batched
+                    ).logits
+                    old_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1).detach()
+
+            # 4. Log probabilities under reference policy (no gradient - for KL penalty)
+            with self.compute_loss_context_manager():
                 with torch.no_grad():
                     if self.ref_model is not None:
                         ref_outputs = self.ref_model(
@@ -384,47 +394,59 @@ class LLaVATrainer(Trainer):
                     else:
                         ref_token_log_probs = old_logp
 
-            # 5. Calculate Group Relative Advantages (Local Normalization)
-            rewards_tensor = torch.tensor(group_rewards, dtype=torch.float, device=device)
-            mean_r = rewards_tensor.mean()
-            std_r = rewards_tensor.std() + 1e-8
-            advantages = ((rewards_tensor - mean_r) / std_r).unsqueeze(-1)  # [G, 1] to broadcast with gen_len
+            # 5. Compute GRPO Loss over PPO inner epochs
+            ppo_epochs = getattr(self.args, "grpo_inner_epochs", 2)
+            
+            for epoch in range(ppo_epochs):
+                with self.compute_loss_context_manager():
+                    # Log probabilities under active policy (GRADIENTS ENABLED)
+                    new_logits = model(
+                        input_ids=output_ids, 
+                        images=images_batched,
+                        token_refer_id=token_refer_id_batched,
+                        refer_embedding_indices=refer_embedding_indices_full_batched
+                    ).logits
+                    new_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1)
+                    
+                    # Ratio has active gradients through new_logp
+                    ratio = torch.exp(new_logp - old_logp)
 
-            # 6. Compute GRPO Loss (Policy Loss + stable k3 KL Penalty)
-            # Ratio has active gradients through new_logp
-            ratio = torch.exp(new_logp - old_logp)
+                    # Mask out padding tokens to prevent gradient distortion
+                    pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+                    gen_attention_mask = (gen_ids != pad_token_id).float()
+                    denom = gen_attention_mask.sum(dim=-1).clamp(min=1.0)
 
-            # Mask out padding tokens to prevent gradient distortion
-            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
-            gen_attention_mask = (gen_ids != pad_token_id).float()
-            denom = gen_attention_mask.sum(dim=-1).clamp(min=1.0)
+                    # Policy objective
+                    surr1 = ratio * advantages
+                    surr2 = torch.clamp(ratio, 0.8, 1.2) * advantages
+                    policy_loss = (-torch.min(surr1, surr2) * gen_attention_mask).sum(dim=-1) / denom  # [G]
 
-            # Policy objective
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 0.8, 1.2) * advantages
-            policy_loss = (-torch.min(surr1, surr2) * gen_attention_mask).sum(dim=-1) / denom  # [G]
+                    # Stable k3 KL Divergence Penalty
+                    log_ratio = ref_token_log_probs - new_logp
+                    kl = torch.exp(log_ratio) - 1 - log_ratio
+                    kl_loss = (self.args.kl_coeff * kl * gen_attention_mask).sum(dim=-1) / denom  # [G]
 
-            # Stable k3 KL Divergence Penalty: exp(ref_log_prob - log_prob) - 1 - (ref_log_prob - log_prob)
-            log_ratio = ref_token_log_probs - new_logp
-            kl = torch.exp(log_ratio) - 1 - log_ratio
-            kl_loss = (self.args.kl_coeff * kl * gen_attention_mask).sum(dim=-1) / denom  # [G]
+                    # Total loss averaged over group size
+                    total_loss = (policy_loss + kl_loss).mean()
+                    
+                # Backward pass for this inner epoch (scaled by ppo_epochs and batch_size)
+                loss_to_backward = total_loss / (ppo_epochs * batch_size)
+                if self.args.gradient_accumulation_steps > 1:
+                    loss_to_backward = loss_to_backward / self.args.gradient_accumulation_steps
+                
+                self.accelerator.backward(loss_to_backward)
+                
+                if epoch < ppo_epochs - 1:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+            
+            accumulated_loss += total_loss.detach()
 
-            # Total loss averaged over group size
-            total_loss = (policy_loss + kl_loss).mean()
-            accumulated_loss += total_loss
-
-        # Explicit backward pass to update the active policy network
+        # Explicit backward pass is handled inside the PPO inner loop, so we don't backward again here.
+        # Just return the detatched loss for HF Trainer logging.
+        if not torch.is_tensor(accumulated_loss):
+            accumulated_loss = torch.tensor(accumulated_loss, device=device)
         loss_to_backward = accumulated_loss / batch_size
-
-        if self.args.gradient_accumulation_steps > 1:
-            loss_to_backward = loss_to_backward / self.args.gradient_accumulation_steps
-
-        if self.use_apex:
-            with amp.scale_loss(loss_to_backward, self.optimizer) as scaled_loss:
-                scaled_loss.backward()
-        else:
-            self.accelerator.backward(loss_to_backward)
-
         return loss_to_backward.detach()
 
     def _save_checkpoint(self, model, trial, metrics=None):

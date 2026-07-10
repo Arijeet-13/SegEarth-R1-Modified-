@@ -194,10 +194,14 @@ def predict_masks_given_answers(
     for text, out in zip(answer_texts, outputs):
         pred = out["pred_masks"]
         pred = pred[0] if pred.dim() == 3 else pred
+        raw = out.get("raw_masks")
+        if raw is not None:
+            raw = raw[0] if raw.dim() == 3 else raw
+            raw = raw.detach().cpu()
         results.append({
             "text": text,
             "mask": _binarize(pred.detach().cpu()),   # consistently binarized {0,1} HxW
-            "raw_masks": out.get("raw_masks").cpu() if "raw_masks" in out else None,
+            "raw_masks": raw,
             "score": _mask_confidence(out),
         })
     return results
@@ -210,9 +214,12 @@ def _stack(candidates: List[dict]) -> torch.Tensor:
     return torch.stack([c["mask"] for c in candidates])
 
 
-def aggregate_average(candidates: List[dict], threshold: float = 0.5, **kwargs) -> Tuple[torch.Tensor, dict]:
-    avg = _stack(candidates).mean(0)
-    return _binarize(avg), {"mean_conf": float(avg.mean())}
+def aggregate_average(candidates, threshold=0.5, **kwargs):
+    if all(c.get("raw_masks") is not None for c in candidates):
+        probs = torch.stack([c["raw_masks"].sigmoid() for c in candidates]).mean(0)
+    else:
+        probs = _stack(candidates).mean(0)
+    return (probs > threshold).float(), {"mean_conf": float(probs.mean())}
 
 
 def aggregate_majority_vote(candidates: List[dict], **kwargs) -> Tuple[torch.Tensor, dict]:
@@ -245,11 +252,27 @@ def aggregate_worst_of_n(
     return worst["mask"], {"worst_score": scored[0][0]}
 
 
+def _consensus_score(candidates, idx):
+    own = candidates[idx]["mask"]
+    others = [c["mask"] for j, c in enumerate(candidates) if j != idx]
+    if not others:
+        return candidates[idx]["score"]
+    consensus = (torch.stack(others).mean(0) > 0.5).float()
+    inter = (own * consensus).sum()
+    union = own.sum() + consensus.sum() - inter
+    return float(inter / (union + 1e-8))
+
+def aggregate_consensus_best_of_n(candidates, **kwargs):
+    scored = [(_consensus_score(candidates, i), c) for i, c in enumerate(candidates)]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[0][1]["mask"], {"consensus_score": scored[0][0]}
+
 _AGGREGATORS = {
     "average": aggregate_average,
     "majority_vote": aggregate_majority_vote,
     "best_of_n": aggregate_best_of_n,
     "worst_of_n": aggregate_worst_of_n,
+    "consensus_best_of_n": aggregate_consensus_best_of_n,
 }
 
 
@@ -400,9 +423,13 @@ def parallel_scale_referring(
         pred = out["pred_masks"]
         pred = pred[0] if pred.dim() == 3 else pred
         pred = _flip_mask_back(pred, flipped)
+        raw = out.get("raw_masks")
+        if raw is not None:
+            raw = raw[0] if raw.dim() == 3 else raw
+            raw = _flip_mask_back(raw.detach().cpu(), flipped)
         candidates.append({
             "mask": _binarize(pred.detach().cpu()),
-            "raw_masks": out.get("raw_masks").cpu() if "raw_masks" in out else None,
+            "raw_masks": raw,
             "score": _mask_confidence(out),
         })
 

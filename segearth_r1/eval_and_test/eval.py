@@ -268,6 +268,7 @@ def evaluation():
                             token_refer_id=[inputs['token_refer_id'][b_idx]],
                             refer_embedding_indices=inputs['refer_embedding_indices'][b_idx:b_idx+1],
                             labels=inputs['labels'][b_idx:b_idx+1],
+                            n=data_args.scaling_n,
                             aggregator=data_args.scaling_aggregator
                         )
                         outputs.append({"pred_masks": scaled_res["mask"].cuda(), "scores": None})

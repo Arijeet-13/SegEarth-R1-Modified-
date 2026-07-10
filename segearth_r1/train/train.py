@@ -151,6 +151,7 @@ class TrainingArguments(transformers.TrainingArguments):
     use_grpo: bool = field(default=False, metadata={"help": "Whether to use GRPO reinforcement learning instead of SFT."})
     kl_coeff: float = field(default=0.01, metadata={"help": "KL divergence coefficient for GRPO."})
     group_size: int = field(default=8, metadata={"help": "Group size (number of candidates sampled per prompt) for GRPO."})
+    grpo_inner_epochs: int = field(default=2, metadata={"help": "Number of inner PPO/GRPO epochs per rollout step."})
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):

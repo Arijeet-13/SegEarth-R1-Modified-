@@ -769,7 +769,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             )
 
         loss = None
-        if batch_dataset_type in ['mm_conv', 'reason_seg']: 
+        if batch_dataset_type in ['mm_conv', 'reason_seg', 'refer_seg']: 
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
@@ -862,8 +862,8 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 mask_loss = loss_mask + loss_dice + loss_SEG_class
                 if isinstance(loss_SEG_class, float):
                     loss_SEG_class = torch.tensor(loss_SEG_class, device=mask_loss.device)
-                if batch_dataset_type == 'refer_seg':
-                    llm_loss = torch.tensor(0.0, device=mask_loss.device)
+                # if batch_dataset_type == 'refer_seg':
+                #     llm_loss = torch.tensor(0.0, device=mask_loss.device)
             loss = llm_loss + mask_loss
                 
         if batch_dataset_type == 'mm_conv':

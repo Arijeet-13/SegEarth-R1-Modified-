@@ -247,10 +247,17 @@ class LLaVATrainer(Trainer):
             for attr, val in detached_inner.items():
                 setattr(inner_ref, attr, val)
 
+            # Save policy model's original requires_grad status before ref_model is frozen
+            original_requires_grad = {p: p.requires_grad for p in self.model.parameters()}
+
             # Put on the same GPU device as policy model
             self.ref_device = self.args.device
             self.ref_model.requires_grad_(False).eval()
             self.ref_model.to(self.ref_device)
+
+            # Restore original requires_grad status on self.model's parameters
+            for p, req in original_requires_grad.items():
+                p.requires_grad = req
             
             gc.collect()
             torch.cuda.empty_cache()

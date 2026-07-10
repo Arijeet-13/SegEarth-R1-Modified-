@@ -1,4 +1,5 @@
 import os
+import gc
 import torch
 import shutil
 import copy
@@ -211,18 +212,27 @@ class LLaVATrainer(Trainer):
         num_steps = len(train_dl) * int(self.args.num_train_epochs) * ppo_epochs
         
         if not hasattr(self, 'ref_model'):
+            self.ref_device = torch.device('cuda:1') if torch.cuda.device_count() > 1 else self.args.device
             self.ref_model = copy.deepcopy(self.model)
-            if hasattr(self.model, 'get_model') and hasattr(self.model.get_model(), 'predictor'):
-                self.ref_model.get_model().predictor = self.model.get_model().predictor
-                self.ref_model.get_model().pixel_decoder = self.model.get_model().pixel_decoder
-            else:
-                self.ref_model.predictor = self.model.predictor
-                self.ref_model.pixel_decoder = self.model.pixel_decoder
-            # vision_tower always lives on the inner model, regardless of where predictor lives
-            if getattr(self.args, "train_backbone", False) is False:
-                self.ref_model.get_model().vision_tower = self.model.get_model().vision_tower
+            if self.ref_device == self.args.device:
+                # Same GPU: share the heavy submodules by reference to avoid a second copy.
+                if hasattr(self.model, 'get_model') and hasattr(self.model.get_model(), 'predictor'):
+                    self.ref_model.get_model().predictor = self.model.get_model().predictor
+                    self.ref_model.get_model().pixel_decoder = self.model.get_model().pixel_decoder
+                else:
+                    self.ref_model.predictor = self.model.predictor
+                    self.ref_model.pixel_decoder = self.model.pixel_decoder
+                if getattr(self.args, "train_backbone", False) is False:
+                    self.ref_model.get_model().vision_tower = self.model.get_model().vision_tower
             self.ref_model.requires_grad_(False).eval()
-            self.ref_model.to(self.args.device)
+            self.ref_model.to(self.ref_device)
+            # The deepcopy above briefly allocated its own copies of the (large)
+            # vision_tower/predictor/pixel_decoder weights before we replaced them
+            # with shared references above. Force those orphaned CUDA tensors to be
+            # released back to the allocator now instead of leaving a memory spike
+            # sitting around when we hit generate() a few lines later.
+            gc.collect()
+            torch.cuda.empty_cache()
 
         self.create_optimizer_and_scheduler(num_training_steps=num_steps)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
@@ -323,6 +333,7 @@ class LLaVATrainer(Trainer):
                 _prev_forward = self.model.__dict__.get('forward', None)
                 self.model.forward = types.MethodType(type(self.model).forward, self.model)
                 images_batched = images_batched.to(dtype=next(self.model.get_model().get_vision_tower().parameters()).dtype)
+                torch.cuda.empty_cache()
                 try:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         outputs = self.model.generate(
@@ -342,23 +353,17 @@ class LLaVATrainer(Trainer):
                     else:
                         del self.model.forward
 
+                # HF's `generate()` already returns a single padded [G, total_len] tensor
+                # when return_dict_in_generate=True, so outputs.sequences needs no further
+                # padding here. (The old code referenced an undefined `outputs_list` /
+                # `pad_token_id` and would crash with NameError as soon as generate()
+                # succeeded.)
                 output_ids = outputs.sequences  # [G, total_len]
-
-                
-                # Pad all sequences in the group to the maximum length
-                max_len = max(seq.shape[0] for seq in outputs_list)
-                padded_outputs = []
-                for seq in outputs_list:
-                    if seq.shape[0] < max_len:
-                        padding = torch.full((max_len - seq.shape[0],), pad_token_id, dtype=seq.dtype, device=seq.device)
-                        seq = torch.cat([seq, padding], dim=0)
-                    padded_outputs.append(seq)
-                
-                output_ids = torch.stack(padded_outputs, dim=0)  # [G, max_len]
                 gen_ids = output_ids[:, prompt_ids.size(0):]  # [G, gen_len]
                 gen_len = gen_ids.shape[1]
 
-                # Clear CUDA cache to free up generation activations
+                # Free the generate() activations/KV-cache before the next forward passes
+                del outputs
                 torch.cuda.empty_cache()
 
                 # Filter out negative placeholder token IDs (like -200 and -204) before decoding
@@ -447,15 +452,16 @@ class LLaVATrainer(Trainer):
                 del new_logits
 
                 # Log probabilities under reference policy (no gradient - for KL penalty)
+                rd = self.ref_device
                 with self.compute_loss_context_manager():
                     ref_outputs = self.ref_model(
-                        input_ids=output_ids, 
-                        images=images_batched,
-                        token_refer_id=token_refer_id_batched,
-                        refer_embedding_indices=refer_embedding_indices_full_batched
+                        input_ids=output_ids.to(rd),
+                        images=images_batched.to(rd),
+                        token_refer_id=[t.to(rd) for t in token_refer_id_batched] if token_refer_id_batched is not None else None,
+                        refer_embedding_indices=refer_embedding_indices_full_batched.to(rd) if refer_embedding_indices_full_batched is not None else None
                     )
                 ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
-                ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1)
+                ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_ids.to(rd).unsqueeze(-1)).squeeze(-1).to(device)
                 del ref_outputs, ref_log_probs
                 torch.cuda.empty_cache()
 

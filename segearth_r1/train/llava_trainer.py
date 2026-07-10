@@ -318,18 +318,17 @@ class LLaVATrainer(Trainer):
 
             # 1. Sample G candidate reasoning paths from active policy (no grads)
                 attention_mask_batched = torch.ones_like(prompt_ids_batched)
-                with self.compute_loss_context_manager():
-                    outputs = self.model.generate(
-                        input_ids=prompt_ids_batched,
-                        attention_mask=attention_mask_batched,
-                        images=images_batched,
-                        token_refer_id=token_refer_id_batched,
-                        refer_embedding_indices=refer_embedding_indices_prompt_batched,
-                        do_sample=True,
-                        temperature=1.0,
-                        max_new_tokens=64,
-                        return_dict_in_generate=True,
-                    )
+                outputs = self.model.generate(
+                    input_ids=prompt_ids_batched,
+                    attention_mask=attention_mask_batched,
+                    images=images_batched,
+                    token_refer_id=token_refer_id_batched,
+                    refer_embedding_indices=refer_embedding_indices_prompt_batched,
+                    do_sample=True,
+                    temperature=1.0,
+                    max_new_tokens=64,
+                    return_dict_in_generate=True,
+                )
 
                 output_ids = outputs.sequences  # [G, total_len]
 

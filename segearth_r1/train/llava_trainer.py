@@ -212,9 +212,15 @@ class LLaVATrainer(Trainer):
         num_steps = len(train_dl) * int(self.args.num_train_epochs) * ppo_epochs
         
         if not hasattr(self, 'ref_model'):
-            self.ref_device = torch.device('cuda:1') if torch.cuda.device_count() > 1 else torch.device('cpu')
-            self.ref_model = copy.deepcopy(self.model).to(self.ref_device)
+            self.ref_device = self.args.device
+            self.ref_model = copy.deepcopy(self.model)
+            inner_ref = self.ref_model.get_model() if hasattr(self.ref_model, 'get_model') else self.ref_model
+            inner_model = self.model.get_model() if hasattr(self.model, 'get_model') else self.model
+            self._ref_shared_attrs = [a for a in ('vision_tower', 'predictor', 'pixel_decoder') if hasattr(inner_model, a)]
+            for attr in self._ref_shared_attrs:
+                setattr(inner_ref, attr, None)  # drop the deepcopy's duplicate before it's ever moved to GPU
             self.ref_model.requires_grad_(False).eval()
+            self.ref_model.to('cpu')  # only the (small) LLM backbone now; parked on CPU
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -437,7 +443,12 @@ class LLaVATrainer(Trainer):
                 del new_logits
 
                 # Log probabilities under reference policy (no gradient - for KL penalty)
-                rd = self.ref_device
+                rd = self.args.device
+                inner_ref = self.ref_model.get_model() if hasattr(self.ref_model, 'get_model') else self.ref_model
+                inner_model = self.model.get_model() if hasattr(self.model, 'get_model') else self.model
+                self.ref_model.to(rd)  # moves only the LLM backbone (small); shared attrs are still None
+                for attr in self._ref_shared_attrs:
+                    setattr(inner_ref, attr, getattr(inner_model, attr))  # borrow self.model's GPU copies
                 with self.compute_loss_context_manager():
                     ref_outputs = self.ref_model(
                         input_ids=output_ids.to(rd),
@@ -448,6 +459,9 @@ class LLaVATrainer(Trainer):
                 ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
                 ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_ids.to(rd).unsqueeze(-1)).squeeze(-1).to(device)
                 del ref_outputs, ref_log_probs
+                for attr in self._ref_shared_attrs:
+                    setattr(inner_ref, attr, None)  # release borrowed refs before offloading
+                self.ref_model.to('cpu')
                 torch.cuda.empty_cache()
 
                 rollouts.append({
@@ -608,44 +622,3 @@ class LLaVATrainer(Trainer):
                 self.log(loss_dict)
 
         return (loss, outputs) if return_outputs else loss
-
-    # def training_step(self, model, inputs) -> torch.Tensor:
-    #     """
-    #     Perform a training step on a batch of inputs.
-    #
-    #     Subclass and override to inject custom behavior.
-    #
-    #     Args:
-    #         model (`nn.Module`):
-    #             The model to train.
-    #         inputs (`Dict[str, Union[torch.Tensor, Any]]`):
-    #             The inputs and targets of the model.
-    #
-    #             The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
-    #             argument `labels`. Check your model's documentation for all accepted arguments.
-    #
-    #     Return:
-    #         `torch.Tensor`: The tensor with training loss on this batch.
-    #     """
-    #     model.train()
-    #     inputs = self._prepare_inputs(inputs)
-    #
-    #     if is_sagemaker_mp_enabled():
-    #         loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
-    #         return loss_mb.reduce_mean().detach().to(self.args.device)
-    #
-    #     with self.compute_loss_context_manager():
-    #         loss = self.compute_loss(model, inputs)
-    #
-    #     if self.args.n_gpu > 1:
-    #         loss = loss.mean()  # mean() to average on multi-gpu parallel training
-    #
-    #     if self.do_grad_scaling:
-    #         self.scaler.scale(loss).backward()
-    #     elif self.use_apex:
-    #         with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-    #             scaled_loss.backward()
-    #     else:
-    #         self.accelerator.backward(loss)
-    #
-    #     return loss.detach() / self.args.gradient_accumulation_steps

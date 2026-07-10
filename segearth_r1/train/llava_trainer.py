@@ -8,6 +8,7 @@ from transformers.modeling_utils import unwrap_model
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 import torch.distributed as dist
 from typing import Optional
+from transformers.trainer_utils import get_last_checkpoint
 from torch import nn
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 from transformers.utils import is_sagemaker_mp_enabled, is_apex_available, is_torch_tpu_available,is_accelerate_available
@@ -202,9 +203,9 @@ class LLaVATrainer(Trainer):
     def train(self, resume_from_checkpoint=None, **kwargs):
         if not getattr(self.args, 'use_grpo', False):
             return super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
-        return self._grpo_train_loop()
+        return self._grpo_train_loop(resume_from_checkpoint=resume_from_checkpoint)
 
-    def _grpo_train_loop(self):
+    def _grpo_train_loop(self, resume_from_checkpoint=None):
         train_dl = self.get_train_dataloader()
         ppo_epochs = getattr(self.args, "grpo_inner_epochs", 2)
         num_steps = len(train_dl) * int(self.args.num_train_epochs) * ppo_epochs
@@ -212,6 +213,19 @@ class LLaVATrainer(Trainer):
         self.create_optimizer_and_scheduler(num_training_steps=num_steps)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self.state.global_step = 0
+        if resume_from_checkpoint:
+            ckpt = resume_from_checkpoint if isinstance(resume_from_checkpoint, str) \
+                else get_last_checkpoint(self.args.output_dir)
+            if ckpt:
+                self._load_from_checkpoint(ckpt)
+                state = TrainerState.load_from_json(os.path.join(ckpt, TRAINER_STATE_NAME))
+                self.state.global_step = state.global_step
+                opt_path = os.path.join(ckpt, OPTIMIZER_NAME)
+                if os.path.exists(opt_path):
+                    self.optimizer.load_state_dict(torch.load(opt_path, map_location="cpu"))
+                sch_path = os.path.join(ckpt, SCHEDULER_NAME)
+                if os.path.exists(sch_path) and self.lr_scheduler is not None:
+                    self.lr_scheduler.load_state_dict(torch.load(sch_path, map_location="cpu"))
 
         if not hasattr(self, 'ref_model'):
             try:
@@ -234,6 +248,8 @@ class LLaVATrainer(Trainer):
                 for ep in range(ppo_epochs):
                     self.model.train()
                     loss = self._grpo_loss(rollout)           # grad-enabled: new_logp, ratio, surrogate, KL
+                    if self.args.gradient_accumulation_steps > 1:
+                        loss = loss / self.args.gradient_accumulation_steps
                     self.accelerator.backward(loss)
                     self.accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
                     self.optimizer.step()
@@ -254,6 +270,7 @@ class LLaVATrainer(Trainer):
         self.save_state()
 
     def _collect_rollout(self, inputs) -> Optional[List[dict]]:
+        self.model.eval()
         device = inputs['images'].device
         batch_size = inputs['input_ids'].shape[0]
         rollouts = []
@@ -291,16 +308,17 @@ class LLaVATrainer(Trainer):
 
                 # 1. Sample G candidate reasoning paths from active policy (no grads)
                 attention_mask_batched = torch.ones_like(prompt_ids_batched)
-                outputs = self.model.generate(
-                    input_ids=prompt_ids_batched,
-                    attention_mask=attention_mask_batched,
-                    images=images_batched,
-                    token_refer_id=token_refer_id_batched,
-                    refer_embedding_indices=refer_embedding_indices_prompt_batched,
-                    do_sample=True,
-                    temperature=1.0,
-                    return_dict_in_generate=True,
-                )
+                with self.compute_loss_context_manager():
+                    outputs = self.model.generate(
+                        input_ids=prompt_ids_batched,
+                        attention_mask=attention_mask_batched,
+                        images=images_batched,
+                        token_refer_id=token_refer_id_batched,
+                        refer_embedding_indices=refer_embedding_indices_prompt_batched,
+                        do_sample=True,
+                        temperature=1.0,
+                        return_dict_in_generate=True,
+                    )
 
                 output_ids = outputs.sequences  # [G, total_len]
                 gen_ids = output_ids[:, prompt_ids.size(0):]  # [G, gen_len]
@@ -372,7 +390,7 @@ class LLaVATrainer(Trainer):
 
                 if std_r < 1e-4:
                     print(f"[GRPO debug] near-zero reward variance (std={std_r:.6f}); skipping this example")
-                    return None
+                    continue
                 
                 advantages = ((rewards_tensor - mean_r) / (std_r + 1e-8)).unsqueeze(-1)  # [G, 1]
 
@@ -385,34 +403,36 @@ class LLaVATrainer(Trainer):
                     refer_embedding_indices_full_batched = None
 
                 # Log probabilities under initial active policy (baseline for ratio)
-                new_logits = self.model(
-                    input_ids=output_ids, 
-                    images=images_batched,
-                    token_refer_id=token_refer_id_batched,
-                    refer_embedding_indices=refer_embedding_indices_full_batched
-                ).logits
-                old_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1).detach()
-
-                # Log probabilities under reference policy (no gradient - for KL penalty)
-                if self.ref_model is not None:
-                    ref_outputs = self.ref_model(
+                with self.compute_loss_context_manager():
+                    new_logits = self.model(
                         input_ids=output_ids, 
                         images=images_batched,
                         token_refer_id=token_refer_id_batched,
                         refer_embedding_indices=refer_embedding_indices_full_batched
-                    )
-                else:
-                    # PEFT/LoRA adapter disabling fallback for DeepSpeed compatibility
-                    if hasattr(self.model, 'disable_adapter'):
-                        with self.model.disable_adapter():
-                            ref_outputs = self.model(
-                                input_ids=output_ids, 
-                                images=images_batched,
-                                token_refer_id=token_refer_id_batched,
-                                refer_embedding_indices=refer_embedding_indices_full_batched
-                            )
+                    ).logits
+                old_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1).detach()
+
+                # Log probabilities under reference policy (no gradient - for KL penalty)
+                with self.compute_loss_context_manager():
+                    if self.ref_model is not None:
+                        ref_outputs = self.ref_model(
+                            input_ids=output_ids, 
+                            images=images_batched,
+                            token_refer_id=token_refer_id_batched,
+                            refer_embedding_indices=refer_embedding_indices_full_batched
+                        )
                     else:
-                        ref_outputs = None
+                        # PEFT/LoRA adapter disabling fallback for DeepSpeed compatibility
+                        if hasattr(self.model, 'disable_adapter'):
+                            with self.model.disable_adapter():
+                                ref_outputs = self.model(
+                                    input_ids=output_ids, 
+                                    images=images_batched,
+                                    token_refer_id=token_refer_id_batched,
+                                    refer_embedding_indices=refer_embedding_indices_full_batched
+                                )
+                        else:
+                            ref_outputs = None
 
                 if ref_outputs is not None:
                     ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
@@ -433,7 +453,7 @@ class LLaVATrainer(Trainer):
                     "ref_token_log_probs": ref_token_log_probs,
                 })
         
-        return rollouts
+        return rollouts if rollouts else None
 
     def _grpo_loss(self, rollouts: List[dict]) -> torch.Tensor:
         total_loss_accumulated = 0.0
@@ -450,12 +470,13 @@ class LLaVATrainer(Trainer):
             ref_token_log_probs = rollout["ref_token_log_probs"]
 
             # Log probabilities under active policy (GRADIENTS ENABLED)
-            new_logits = self.model(
-                input_ids=output_ids, 
-                images=images_batched,
-                token_refer_id=token_refer_id_batched,
-                refer_embedding_indices=refer_embedding_indices_full_batched
-            ).logits
+            with self.compute_loss_context_manager():
+                new_logits = self.model(
+                    input_ids=output_ids, 
+                    images=images_batched,
+                    token_refer_id=token_refer_id_batched,
+                    refer_embedding_indices=refer_embedding_indices_full_batched
+                ).logits
             new_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1)
             
             # Ratio has active gradients through new_logp

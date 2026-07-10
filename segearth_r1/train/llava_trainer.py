@@ -331,6 +331,7 @@ class LLaVATrainer(Trainer):
         # We need to run generation and reward calculation under no_grad
         with torch.no_grad():
             for b_idx in range(batch_size):
+                print(f"[ITER] entering b_idx={b_idx}", flush=True)
                 input_ids = inputs['input_ids'][b_idx]
                 labels = inputs['labels'][b_idx]
                 
@@ -458,10 +459,10 @@ class LLaVATrainer(Trainer):
                 rewards_tensor = torch.tensor(group_rewards, dtype=torch.float, device=device)
                 mean_r = rewards_tensor.mean()
                 std_r = rewards_tensor.std() if rewards_tensor.numel() > 1 else torch.tensor(0.0, device=device)
-                print(f"[GRPO debug] batch_idx={b_idx} answers={answer_texts} rewards={['%.6f' % r for r in group_rewards]}  mean={mean_r.item():.6f}  std={std_r.item():.6f}")
+                print(f"[GRPO debug] batch_idx={b_idx} answers={answer_texts} rewards={['%.6f' % r for r in group_rewards]}  mean={mean_r.item():.6f}  std={std_r.item():.6f}", flush=True)
 
                 if std_r < 1e-4:
-                    print(f"[GRPO debug] near-zero reward variance (std={std_r:.6f}); skipping this example")
+                    print(f"[ITER] SKIPPED b_idx={b_idx} std={std_r:.6f}", flush=True)
                     continue
                 
                 advantages = ((rewards_tensor - mean_r) / (std_r + 1e-8)).unsqueeze(-1)  # [G, 1]

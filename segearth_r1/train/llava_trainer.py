@@ -328,7 +328,7 @@ class LLaVATrainer(Trainer):
                             refer_embedding_indices=refer_embedding_indices_prompt_batched,
                             do_sample=True,
                             temperature=getattr(self.args, "grpo_temperature", 1.0),
-                            max_new_tokens=64,
+                            max_new_tokens=32,
                             return_dict_in_generate=True,
                         )
                 finally:

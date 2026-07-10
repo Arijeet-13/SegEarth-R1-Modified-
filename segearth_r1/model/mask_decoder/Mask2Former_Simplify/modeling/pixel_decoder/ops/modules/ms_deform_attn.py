@@ -99,9 +99,9 @@ class MSDeformAttn(nn.Module):
         if input_padding_mask is not None:
             value = value.masked_fill(input_padding_mask[..., None], float(0))
         value = value.view(N, Len_in, self.n_heads, self.d_model // self.n_heads)
-        self.sampling_offsets.bias = self.sampling_offsets.bias.to(self.sampling_offsets.weight.dtype)
-        sampling_offsets = self.sampling_offsets(query).view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
-        attention_weights = self.attention_weights(query).view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
+        query_dtype = self.sampling_offsets.weight.dtype
+        sampling_offsets = self.sampling_offsets(query.to(dtype=query_dtype)).view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
+        attention_weights = self.attention_weights(query.to(dtype=query_dtype)).view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
         attention_weights = F.softmax(attention_weights, -1).view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
 
         # N, Len_q, n_heads, n_levels, n_points, 3        

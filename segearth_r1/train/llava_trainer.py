@@ -199,17 +199,23 @@ class LLaVATrainer(Trainer):
         union = pred_prob.sum() + gt.sum() - intersection
         return float(intersection / (union + 1e-8))
 
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+    def train(self, resume_from_checkpoint=None, **kwargs):
         if not getattr(self.args, 'use_grpo', False):
-            return super().training_step(model, inputs)
+            return super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
+        return self._grpo_train_loop()
 
-        model.train()
-        inputs = self._prepare_inputs(inputs)
+    def _grpo_train_loop(self):
+        train_dl = self.get_train_dataloader()
+        ppo_epochs = getattr(self.args, "grpo_inner_epochs", 2)
+        num_steps = len(train_dl) * int(self.args.num_train_epochs) * ppo_epochs
+        
+        self.create_optimizer_and_scheduler(num_training_steps=num_steps)
+        self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+        self.state.global_step = 0
 
-        # Initialize reference model if not done yet
         if not hasattr(self, 'ref_model'):
             try:
-                self.ref_model = copy.deepcopy(model)
+                self.ref_model = copy.deepcopy(self.model)
                 self.ref_model.eval()
                 for p in self.ref_model.parameters():
                     p.requires_grad = False
@@ -217,237 +223,270 @@ class LLaVATrainer(Trainer):
                 self.ref_model = None
                 print(f"[GRPO] WARNING: ref_model deepcopy failed ({e}); KL penalty disabled this run.")
 
+        device = self.args.device
+
+        for epoch in range(int(self.args.num_train_epochs)):
+            for inputs in train_dl:
+                inputs = self._prepare_inputs(inputs)
+                rollout = self._collect_rollout(inputs)      # no_grad: gen, reward, advantage, old_logp, ref_logp
+                if rollout is None:                          # zero-variance skip
+                    continue
+                for ep in range(ppo_epochs):
+                    self.model.train()
+                    loss = self._grpo_loss(rollout)           # grad-enabled: new_logp, ratio, surrogate, KL
+                    self.accelerator.backward(loss)
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+                    self.optimizer.step()
+                    if self.lr_scheduler is not None:
+                        self.lr_scheduler.step()
+                    self.optimizer.zero_grad()
+                    self.state.global_step += 1
+                    
+                    if self.state.global_step % self.args.logging_steps == 0:
+                        self.log({"grpo_loss": loss.item(), "ppo_epoch": ep, "learning_rate": self.optimizer.param_groups[0]['lr'] if self.optimizer else self.args.learning_rate})
+                
+                if self.args.save_strategy == "steps" and self.args.save_steps > 0 and self.state.global_step % self.args.save_steps == 0:
+                    self._save_checkpoint(self.model, trial=None)
+            
+            if self.args.save_strategy == "epoch":
+                self._save_checkpoint(self.model, trial=None)
+                
+        self.save_state()
+
+    def _collect_rollout(self, inputs) -> Optional[List[dict]]:
         device = inputs['images'].device
         batch_size = inputs['input_ids'].shape[0]
+        rollouts = []
         
-        # Accumulate and average the loss over the batch size to support batch_size > 1
-        accumulated_loss = 0.0
-        
-        for b_idx in range(batch_size):
-            input_ids = inputs['input_ids'][b_idx]
-            labels = inputs['labels'][b_idx]
-            
-            # Find prompt length: index of first non-ignore token
-            non_ignore_indices = (labels != -100).nonzero(as_tuple=True)[0]
-            if len(non_ignore_indices) > 0:
-                prompt_len = non_ignore_indices[0].item()
-            else:
-                prompt_len = len(labels)
+        # We need to run generation and reward calculation under no_grad
+        with torch.no_grad():
+            for b_idx in range(batch_size):
+                input_ids = inputs['input_ids'][b_idx]
+                labels = inputs['labels'][b_idx]
                 
-            prompt_ids = input_ids[:prompt_len]
-            image_tensor = inputs['images'][b_idx:b_idx+1] # [1, 3, H, W]
-            gt_mask = inputs.get('masks', None)
-            if gt_mask is not None:
-                gt_mask = gt_mask[b_idx]
-
-            # Replicate input prompt and images to batch size G before generating
-            prompt_ids_batched = prompt_ids.unsqueeze(0).repeat(self.args.group_size, 1)
-            images_batched = image_tensor.repeat(self.args.group_size, 1, 1, 1)
-
-            # Replicate refer token ID and embedding indices to support generation/forward calls
-            token_refer_id = inputs.get('token_refer_id', None)
-            if token_refer_id is not None:
-                token_refer_id_batched = [token_refer_id[b_idx]] * self.args.group_size
-            else:
-                token_refer_id_batched = None
-
-            refer_embedding_indices = inputs.get('refer_embedding_indices', None)
-            if refer_embedding_indices is not None:
-                prompt_ref_indices = refer_embedding_indices[b_idx][:prompt_len]
-                refer_embedding_indices_prompt_batched = prompt_ref_indices.unsqueeze(0).repeat(self.args.group_size, 1)
-            else:
-                refer_embedding_indices_prompt_batched = None
-
-            # 1. Sample G candidate reasoning paths from active policy (no grads)
-            attention_mask_batched = torch.ones_like(prompt_ids_batched)
-            with self.compute_loss_context_manager():
-                with torch.no_grad():
-                    outputs = model.generate(
-                        input_ids=prompt_ids_batched,
-                        attention_mask=attention_mask_batched,
-                        images=images_batched,
-                        token_refer_id=token_refer_id_batched,
-                        refer_embedding_indices=refer_embedding_indices_prompt_batched,
-                        do_sample=True,
-                        temperature=1.0,
-                        return_dict_in_generate=True,
-                    )
-
-            output_ids = outputs.sequences  # [G, total_len]
-            gen_ids = output_ids[:, prompt_ids.size(0):]  # [G, gen_len]
-            gen_len = gen_ids.shape[1]
-
-            # Clear CUDA cache to free up generation activations
-            torch.cuda.empty_cache()
-
-            # Filter out negative placeholder token IDs (like -200 and -204) before decoding
-            clean_prompt_ids = prompt_ids[prompt_ids >= 0]
-            question = self.tokenizer.decode(clean_prompt_ids, skip_special_tokens=True).replace(PREFIX_INST, "").strip()
-            answer_texts = [self.tokenizer.decode(g[g >= 0], skip_special_tokens=True).strip() for g in gen_ids]
-
-            image_cpu = image_tensor.squeeze(0).cpu()
-            items = [_build_reasoning_item(image_cpu, question, ans, self.tokenizer) for ans in answer_texts]
-
-            # Collate items using DataCollector
-            batch = DataCollector(tokenizer=self.tokenizer)(items)
-            batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
-            batch["token_refer_id"] = [t.to(device) for t in batch["token_refer_id"]]
-            batch["token_answer_id"] = [t.to(device) for t in batch["token_answer_id"]]
-
-            # Predict masks
-            with self.compute_loss_context_manager():
-                with torch.no_grad():
-                    outputs_seg = model.eval_seg(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        images=batch["images"].float(),
-                        masks=None,
-                        token_refer_id=batch["token_refer_id"],
-                        refer_embedding_indices=batch["refer_embedding_indices"],
-                        labels=batch["labels"],
-                        token_answer_id=batch["token_answer_id"],
-                        answer_embedding_indices=batch["answer_embedding_indices"],
-                    )
-            # Clear CUDA cache after mask prediction
-            torch.cuda.empty_cache()
-
-            # Calculate rewards (IoU only, using soft IoU fallback to avoid early cold-start zero advantages)
-            group_rewards = []
-            for i, out in enumerate(outputs_seg):
-                raw_mask = out.get("raw_masks", None)
-                if raw_mask is not None:
-                    pred_prob = raw_mask.sigmoid()
-                    pred_prob = pred_prob[0] if pred_prob.dim() == 3 else pred_prob
-                    pred_prob = pred_prob.to(device)
-                    if gt_mask is not None:
-                        r_iou = self.compute_soft_iou_reward(pred_prob, gt_mask)
-                    else:
-                        r_iou = 0.0
+                # Find prompt length: index of first non-ignore token
+                prompt_len = int(labels.ne(-100).sum())
+                prompt_ids = input_ids[:prompt_len]
+                
+                # We replicate prompt G times for the group
+                prompt_ids_batched = prompt_ids.unsqueeze(0).repeat(self.args.group_size, 1)
+                
+                # Prepare other keys for generation
+                image_tensor = inputs['images'][b_idx]
+                images_batched = image_tensor.unsqueeze(0).repeat(self.args.group_size, 1, 1, 1)
+                
+                token_refer_id = inputs.get('token_refer_id', None)
+                if token_refer_id is not None:
+                    token_refer_id_batched = [token_refer_id[b_idx]] * self.args.group_size
                 else:
-                    pred = out["pred_masks"]
-                    pred_mask = pred[0] if pred.dim() == 3 else pred
-                    if gt_mask is not None:
-                        r_iou = self.compute_iou_reward(pred_mask, gt_mask)
-                    else:
-                        r_iou = 0.0
-                group_rewards.append(r_iou)
+                    token_refer_id_batched = None
 
-            # Debug rewards logging
-            rewards_tensor = torch.tensor(group_rewards, dtype=torch.float, device=device)
-            print(f"[GRPO debug] rewards={['%.6f' % r for r in group_rewards]}  mean={rewards_tensor.mean().item():.6f}  std={rewards_tensor.std().item():.6f}")
+                refer_embedding_indices = inputs.get('refer_embedding_indices', None)
+                if refer_embedding_indices is not None:
+                    prompt_ref_indices = refer_embedding_indices[b_idx][:prompt_len]
+                    refer_embedding_indices_prompt_batched = prompt_ref_indices.unsqueeze(0).repeat(self.args.group_size, 1)
+                else:
+                    prompt_ref_indices = None
+                    refer_embedding_indices_prompt_batched = None
 
-            # Replicate refer embedding indices for the full output sequence (prompt + generation)
-            if refer_embedding_indices is not None:
-                gen_ref_indices = torch.zeros(gen_len, dtype=prompt_ref_indices.dtype, device=prompt_ref_indices.device)
-                full_ref_indices = torch.cat([prompt_ref_indices, gen_ref_indices], dim=0)
-                refer_embedding_indices_full_batched = full_ref_indices.unsqueeze(0).repeat(self.args.group_size, 1)
-            else:
-                refer_embedding_indices_full_batched = None
+                # 1. Sample G candidate reasoning paths from active policy (no grads)
+                attention_mask_batched = torch.ones_like(prompt_ids_batched)
+                outputs = self.model.generate(
+                    input_ids=prompt_ids_batched,
+                    attention_mask=attention_mask_batched,
+                    images=images_batched,
+                    token_refer_id=token_refer_id_batched,
+                    refer_embedding_indices=refer_embedding_indices_prompt_batched,
+                    do_sample=True,
+                    temperature=1.0,
+                    return_dict_in_generate=True,
+                )
 
-            # Calculate standard deviation and z-score advantages
-            rewards_tensor = torch.tensor(group_rewards, dtype=torch.float, device=device)
-            mean_r = rewards_tensor.mean()
-            std_r = rewards_tensor.std()
-            if std_r < 1e-4:
-                print(f"[GRPO debug] near-zero reward variance (std={std_r:.6f}); skipping this example")
-                continue
-            advantages = ((rewards_tensor - mean_r) / (std_r + 1e-8)).unsqueeze(-1)  # [G, 1] to broadcast with gen_len
+                output_ids = outputs.sequences  # [G, total_len]
+                gen_ids = output_ids[:, prompt_ids.size(0):]  # [G, gen_len]
+                gen_len = gen_ids.shape[1]
 
-            # 3. Log probabilities under initial active policy (no gradient - baseline for ratio)
-            with self.compute_loss_context_manager():
-                with torch.no_grad():
-                    new_logits = model(
-                        input_ids=output_ids, 
-                        images=images_batched,
-                        token_refer_id=token_refer_id_batched,
-                        refer_embedding_indices=refer_embedding_indices_full_batched
-                    ).logits
-                    old_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1).detach()
+                # Clear CUDA cache to free up generation activations
+                torch.cuda.empty_cache()
 
-            # 4. Log probabilities under reference policy (no gradient - for KL penalty)
-            with self.compute_loss_context_manager():
-                with torch.no_grad():
-                    if self.ref_model is not None:
-                        ref_outputs = self.ref_model(
-                            input_ids=output_ids, 
-                            images=images_batched,
-                            token_refer_id=token_refer_id_batched,
-                            refer_embedding_indices=refer_embedding_indices_full_batched
-                        )
-                    else:
-                        # PEFT/LoRA adapter disabling fallback for DeepSpeed compatibility
-                        if hasattr(model, 'disable_adapter'):
-                            with model.disable_adapter():
-                                ref_outputs = model(
-                                    input_ids=output_ids, 
-                                    images=images_batched,
-                                    token_refer_id=token_refer_id_batched,
-                                    refer_embedding_indices=refer_embedding_indices_full_batched
-                                )
+                # Filter out negative placeholder token IDs (like -200 and -204) before decoding
+                clean_prompt_ids = prompt_ids[prompt_ids >= 0]
+                question = self.tokenizer.decode(clean_prompt_ids, skip_special_tokens=True).replace(PREFIX_INST, "").strip()
+                answer_texts = [self.tokenizer.decode(g[g >= 0], skip_special_tokens=True).strip() for g in gen_ids]
+
+                image_cpu = image_tensor.squeeze(0).cpu()
+                items = [_build_reasoning_item(image_cpu, question, ans, self.tokenizer) for ans in answer_texts]
+
+                # Collate items using DataCollector
+                batch = DataCollector(tokenizer=self.tokenizer)(items)
+                batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+                batch["token_refer_id"] = [t.to(device) for t in batch["token_refer_id"]]
+                batch["token_answer_id"] = [t.to(device) for t in batch["token_answer_id"]]
+
+                # Predict masks
+                outputs_seg = self.model.eval_seg(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    images=batch["images"].float(),
+                    masks=None,
+                    token_refer_id=batch["token_refer_id"],
+                    refer_embedding_indices=batch["refer_embedding_indices"],
+                    labels=batch["labels"],
+                    token_answer_id=batch["token_answer_id"],
+                    answer_embedding_indices=batch["answer_embedding_indices"],
+                )
+                
+                # Clear CUDA cache after mask prediction
+                torch.cuda.empty_cache()
+
+                # Calculate rewards (IoU only, using soft IoU fallback to avoid early cold-start zero advantages)
+                group_rewards = []
+                gt_mask = inputs.get("masks", None)
+                if gt_mask is not None:
+                    gt_mask = gt_mask[b_idx].to(device)
+                    
+                for i, out in enumerate(outputs_seg):
+                    raw_mask = out.get("raw_masks", None)
+                    if raw_mask is not None:
+                        pred_prob = raw_mask.sigmoid()
+                        pred_prob = pred_prob[0] if pred_prob.dim() == 3 else pred_prob
+                        pred_prob = pred_prob.to(device)
+                        if gt_mask is not None:
+                            r_iou = self.compute_soft_iou_reward(pred_prob, gt_mask)
                         else:
-                            ref_outputs = None
-
-                    if ref_outputs is not None:
-                        ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
-                        gen_slice = gen_ids.unsqueeze(-1)  # [G, gen_len, 1]
-                        ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_slice).squeeze(-1)  # [G, gen_len]
+                            r_iou = 0.0
                     else:
-                        ref_token_log_probs = old_logp
+                        pred = out["pred_masks"]
+                        pred_mask = pred[0] if pred.dim() == 3 else pred
+                        if gt_mask is not None:
+                            r_iou = self.compute_iou_reward(pred_mask, gt_mask)
+                        else:
+                            r_iou = 0.0
+                    group_rewards.append(r_iou)
 
-            # 5. Compute GRPO Loss over PPO inner epochs
-            ppo_epochs = getattr(self.args, "grpo_inner_epochs", 2)
-            
-            for epoch in range(ppo_epochs):
-                with self.compute_loss_context_manager():
-                    # Log probabilities under active policy (GRADIENTS ENABLED)
-                    new_logits = model(
+                # Debug rewards logging
+                rewards_tensor = torch.tensor(group_rewards, dtype=torch.float, device=device)
+                mean_r = rewards_tensor.mean()
+                std_r = rewards_tensor.std()
+                print(f"[GRPO debug] batch_idx={b_idx} rewards={['%.6f' % r for r in group_rewards]}  mean={mean_r.item():.6f}  std={std_r.item():.6f}")
+
+                if std_r < 1e-4:
+                    print(f"[GRPO debug] near-zero reward variance (std={std_r:.6f}); skipping this example")
+                    return None
+                
+                advantages = ((rewards_tensor - mean_r) / (std_r + 1e-8)).unsqueeze(-1)  # [G, 1]
+
+                # Replicate refer embedding indices for the full output sequence (prompt + generation)
+                if refer_embedding_indices is not None:
+                    gen_ref_indices = torch.zeros(gen_len, dtype=prompt_ref_indices.dtype, device=prompt_ref_indices.device)
+                    full_ref_indices = torch.cat([prompt_ref_indices, gen_ref_indices], dim=0)
+                    refer_embedding_indices_full_batched = full_ref_indices.unsqueeze(0).repeat(self.args.group_size, 1)
+                else:
+                    refer_embedding_indices_full_batched = None
+
+                # Log probabilities under initial active policy (baseline for ratio)
+                new_logits = self.model(
+                    input_ids=output_ids, 
+                    images=images_batched,
+                    token_refer_id=token_refer_id_batched,
+                    refer_embedding_indices=refer_embedding_indices_full_batched
+                ).logits
+                old_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1).detach()
+
+                # Log probabilities under reference policy (no gradient - for KL penalty)
+                if self.ref_model is not None:
+                    ref_outputs = self.ref_model(
                         input_ids=output_ids, 
                         images=images_batched,
                         token_refer_id=token_refer_id_batched,
                         refer_embedding_indices=refer_embedding_indices_full_batched
-                    ).logits
-                    new_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1)
-                    
-                    # Ratio has active gradients through new_logp
-                    ratio = torch.exp(new_logp - old_logp)
+                    )
+                else:
+                    # PEFT/LoRA adapter disabling fallback for DeepSpeed compatibility
+                    if hasattr(self.model, 'disable_adapter'):
+                        with self.model.disable_adapter():
+                            ref_outputs = self.model(
+                                input_ids=output_ids, 
+                                images=images_batched,
+                                token_refer_id=token_refer_id_batched,
+                                refer_embedding_indices=refer_embedding_indices_full_batched
+                            )
+                    else:
+                        ref_outputs = None
 
-                    # Mask out padding tokens to prevent gradient distortion
-                    pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
-                    gen_attention_mask = (gen_ids != pad_token_id).float()
-                    denom = gen_attention_mask.sum(dim=-1).clamp(min=1.0)
+                if ref_outputs is not None:
+                    ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
+                    gen_slice = gen_ids.unsqueeze(-1)  # [G, gen_len, 1]
+                    ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_slice).squeeze(-1)  # [G, gen_len]
+                else:
+                    ref_token_log_probs = old_logp
 
-                    # Policy objective
-                    surr1 = ratio * advantages
-                    surr2 = torch.clamp(ratio, 0.8, 1.2) * advantages
-                    policy_loss = (-torch.min(surr1, surr2) * gen_attention_mask).sum(dim=-1) / denom  # [G]
+                rollouts.append({
+                    "output_ids": output_ids,
+                    "gen_ids": gen_ids,
+                    "gen_len": gen_len,
+                    "images_batched": images_batched,
+                    "token_refer_id_batched": token_refer_id_batched,
+                    "refer_embedding_indices_full_batched": refer_embedding_indices_full_batched,
+                    "advantages": advantages,
+                    "old_logp": old_logp,
+                    "ref_token_log_probs": ref_token_log_probs,
+                })
+        
+        return rollouts
 
-                    # Stable k3 KL Divergence Penalty
-                    log_ratio = ref_token_log_probs - new_logp
-                    kl = torch.exp(log_ratio) - 1 - log_ratio
-                    kl_loss = (self.args.kl_coeff * kl * gen_attention_mask).sum(dim=-1) / denom  # [G]
+    def _grpo_loss(self, rollouts: List[dict]) -> torch.Tensor:
+        total_loss_accumulated = 0.0
+        
+        for rollout in rollouts:
+            output_ids = rollout["output_ids"]
+            gen_ids = rollout["gen_ids"]
+            gen_len = rollout["gen_len"]
+            images_batched = rollout["images_batched"]
+            token_refer_id_batched = rollout["token_refer_id_batched"]
+            refer_embedding_indices_full_batched = rollout["refer_embedding_indices_full_batched"]
+            advantages = rollout["advantages"]
+            old_logp = rollout["old_logp"]
+            ref_token_log_probs = rollout["ref_token_log_probs"]
 
-                    # Total loss averaged over group size
-                    total_loss = (policy_loss + kl_loss).mean()
-                    
-                # Backward pass for this inner epoch (scaled by ppo_epochs and batch_size)
-                loss_to_backward = total_loss / (ppo_epochs * batch_size)
-                if self.args.gradient_accumulation_steps > 1:
-                    loss_to_backward = loss_to_backward / self.args.gradient_accumulation_steps
-                
-                self.accelerator.backward(loss_to_backward)
-                
-                if epoch < ppo_epochs - 1:
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
+            # Log probabilities under active policy (GRADIENTS ENABLED)
+            new_logits = self.model(
+                input_ids=output_ids, 
+                images=images_batched,
+                token_refer_id=token_refer_id_batched,
+                refer_embedding_indices=refer_embedding_indices_full_batched
+            ).logits
+            new_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1)
             
-            accumulated_loss += total_loss.detach()
+            # Ratio has active gradients through new_logp
+            ratio = torch.exp(new_logp - old_logp)
 
-        # Explicit backward pass is handled inside the PPO inner loop, so we don't backward again here.
-        # Just return the detatched loss for HF Trainer logging.
-        if not torch.is_tensor(accumulated_loss):
-            accumulated_loss = torch.tensor(accumulated_loss, device=device)
-        loss_to_backward = accumulated_loss / batch_size
-        return loss_to_backward.detach()
+            # Mask out padding tokens to prevent gradient distortion
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            gen_attention_mask = (gen_ids != pad_token_id).float()
+            denom = gen_attention_mask.sum(dim=-1).clamp(min=1.0)
+
+            # Policy objective
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 0.8, 1.2) * advantages
+            policy_loss = (-torch.min(surr1, surr2) * gen_attention_mask).sum(dim=-1) / denom  # [G]
+
+            # Stable k3 KL Divergence Penalty
+            log_ratio = ref_token_log_probs - new_logp
+            kl = torch.exp(log_ratio) - 1 - log_ratio
+            kl_loss = (self.args.kl_coeff * kl * gen_attention_mask).sum(dim=-1) / denom  # [G]
+
+            # Total loss averaged over group size
+            total_loss = (policy_loss + kl_loss).mean()
+            
+            total_loss_accumulated += total_loss
+            
+        return total_loss_accumulated / len(rollouts)
+
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        if not getattr(self.args, 'use_grpo', False):
+            return super().training_step(model, inputs)
+        return torch.tensor(0.0, device=self.args.device)
 
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):

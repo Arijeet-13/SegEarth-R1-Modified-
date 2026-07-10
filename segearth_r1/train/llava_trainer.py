@@ -212,9 +212,9 @@ class LLaVATrainer(Trainer):
         
         if not hasattr(self, 'ref_model'):
             self.ref_model = copy.deepcopy(self.model)
-            self.ref_model.eval()
-            for p in self.ref_model.parameters():
-                p.requires_grad = False
+            self.ref_model.predictor = self.model.predictor
+            self.ref_model.pixel_decoder = self.model.pixel_decoder
+            self.ref_model.requires_grad_(False).eval()
             self.ref_model.to(self.args.device)
 
         self.create_optimizer_and_scheduler(num_training_steps=num_steps)
@@ -426,6 +426,7 @@ class LLaVATrainer(Trainer):
                         refer_embedding_indices=refer_embedding_indices_full_batched
                     ).logits
                 old_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1).detach()
+                del new_logits
 
                 # Log probabilities under reference policy (no gradient - for KL penalty)
                 with self.compute_loss_context_manager():
@@ -437,6 +438,8 @@ class LLaVATrainer(Trainer):
                     )
                 ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
                 ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1)
+                del ref_outputs, ref_log_probs
+                torch.cuda.empty_cache()
 
                 rollouts.append({
                     "output_ids": output_ids,

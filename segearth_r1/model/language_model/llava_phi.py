@@ -1119,13 +1119,13 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
 
             # Flatten and project
             res3_vision = res3_down.flatten(2).permute(0, 2, 1)   # [B, 1024, 256]
-            res3_vision = self.local_project_res3(res3_vision)      # [B, 1024, 512]
+            res3_vision = self.local_project_res3(res3_vision.to(dtype=self.local_project_res3.weight.dtype))      # [B, 1024, 512]
 
             res4_vision = res4_down.flatten(2).permute(0, 2, 1)   # [B, 1024, 512]
-            res4_vision = self.local_project_res4(res4_vision)      # [B, 1024, 512]
+            res4_vision = self.local_project_res4(res4_vision.to(dtype=self.local_project_res4.weight.dtype))      # [B, 1024, 512]
 
             res5_vision = res5_feat.flatten(2).permute(0, 2, 1)    # [B, 1024, 1024]
-            res5_vision = self.local_project_res5(res5_vision)      # [B, 1024, 512]
+            res5_vision = self.local_project_res5(res5_vision.to(dtype=self.local_project_res5.weight.dtype))      # [B, 1024, 512]
 
             # Concatenate: [B, 3072, 512] — only 3× the original, not 21×
             local_vision = torch.cat([res3_vision, res4_vision, res5_vision], dim=1)

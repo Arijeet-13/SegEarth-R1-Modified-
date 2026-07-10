@@ -215,9 +215,13 @@ class LLaVATrainer(Trainer):
             if hasattr(self.model, 'get_model') and hasattr(self.model.get_model(), 'predictor'):
                 self.ref_model.get_model().predictor = self.model.get_model().predictor
                 self.ref_model.get_model().pixel_decoder = self.model.get_model().pixel_decoder
+                if getattr(self.args, "train_backbone", False) is False:
+                    self.ref_model.get_model().vision_tower = self.model.get_model().vision_tower
             else:
                 self.ref_model.predictor = self.model.predictor
                 self.ref_model.pixel_decoder = self.model.pixel_decoder
+                if getattr(self.args, "train_backbone", False) is False:
+                    self.ref_model.vision_tower = self.model.vision_tower
             self.ref_model.requires_grad_(False).eval()
             self.ref_model.to(self.args.device)
 

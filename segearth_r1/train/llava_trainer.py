@@ -254,9 +254,10 @@ class LLaVATrainer(Trainer):
                     self.state.global_step += 1
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
                     if self.state.global_step % self.args.logging_steps == 0:
-                        self.control = self.callback_handler.on_log(self.args, self.state, self.control)
-                        self.log({"grpo_loss": loss.item(), "ppo_epoch": ep,
-                                  "learning_rate": self.optimizer.param_groups[0]['lr'] if self.optimizer else self.args.learning_rate})
+                        logs = {"grpo_loss": loss.item(), "ppo_epoch": ep,
+                                "learning_rate": self.optimizer.param_groups[0]['lr'] if self.optimizer else self.args.learning_rate}
+                        self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
+                        self.log(logs)
                 if self.control.should_save or (self.args.save_strategy == "steps" and self.args.save_steps > 0
                                                  and self.state.global_step % self.args.save_steps == 0):
                     self._save_checkpoint(self.model, trial=None)

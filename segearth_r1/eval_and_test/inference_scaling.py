@@ -262,7 +262,9 @@ def _consensus_score(candidates, idx):
     union = own.sum() + consensus.sum() - inter
     return float(inter / (union + 1e-8))
 
-def aggregate_consensus_best_of_n(candidates, **kwargs):
+def aggregate_consensus_best_of_n(candidates, oracle_iou_fn=None, **kwargs):
+    if oracle_iou_fn:
+        return aggregate_best_of_n(candidates, oracle_iou_fn=oracle_iou_fn)
     scored = [(_consensus_score(candidates, i), c) for i, c in enumerate(candidates)]
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[0][1]["mask"], {"consensus_score": scored[0][0]}
@@ -448,7 +450,7 @@ def make_iou_oracle(gt_mask: torch.Tensor) -> Callable[[torch.Tensor], float]:
     """Builds an `oracle_iou_fn(pred_mask) -> IoU` closure against a known
     ground-truth mask, for reproducing the paper's best-of-n / worst-of-n
     upper- and lower-bound analysis."""
-    gt = (gt_mask > 0).float()
+    gt = (gt_mask.cpu() > 0).float()
 
     def _iou(pred_mask: torch.Tensor) -> float:
         pred = (pred_mask > 0).float()

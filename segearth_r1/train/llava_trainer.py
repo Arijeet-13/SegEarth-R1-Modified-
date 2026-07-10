@@ -212,25 +212,46 @@ class LLaVATrainer(Trainer):
         num_steps = len(train_dl) * int(self.args.num_train_epochs) * ppo_epochs
         
         if not hasattr(self, 'ref_model'):
-            self.ref_device = self.args.device
-            self.ref_model = copy.deepcopy(self.model)
-            
-            # ref_model is only ever called without dataset_type -> forward() early-returns
-            # before touching these; drop them to save host RAM.
-            for attr in ['predictor', 'pixel_decoder', 'seg_query_projector',
-                         'local_project_res3', 'local_project_res4', 'local_project_res5',
-                         'local_project', 'text_projector', 'origin_SEG_token_projector',
-                         'SEG_token_projector', 'd_layers']:
-                if hasattr(self.ref_model, attr):
-                    setattr(self.ref_model, attr, None)
+            # Temporary detachment of heavy submodules to avoid deepcopy memory overhead
+            detached_attrs = {}
+            model_attrs = ['predictor', 'pixel_decoder', 'seg_query_projector',
+                           'local_project_res3', 'local_project_res4', 'local_project_res5',
+                           'local_project', 'text_projector', 'origin_SEG_token_projector',
+                           'SEG_token_projector', 'd_layers']
+            for attr in model_attrs:
+                if hasattr(self.model, attr):
+                    detached_attrs[attr] = getattr(self.model, attr)
+                    setattr(self.model, attr, None)
 
-            inner_ref = self.ref_model.get_model() if hasattr(self.ref_model, 'get_model') else self.ref_model
             inner_model = self.model.get_model() if hasattr(self.model, 'get_model') else self.model
-            self._ref_shared_attrs = [a for a in ('vision_tower',) if hasattr(inner_model, a)]
-            for attr in self._ref_shared_attrs:
-                setattr(inner_ref, attr, None)  # drop the deepcopy's duplicate before it's ever moved to GPU
+            inner_attrs = ['vision_tower', 'mm_projector']
+            detached_inner = {}
+            for attr in inner_attrs:
+                if hasattr(inner_model, attr):
+                    detached_inner[attr] = getattr(inner_model, attr)
+                    setattr(inner_model, attr, None)
+
+            # Deepcopy only the lightweight LLM backbone
+            self.ref_model = copy.deepcopy(self.model)
+
+            # Restore on self.model (policy model)
+            for attr, val in detached_attrs.items():
+                setattr(self.model, attr, val)
+            for attr, val in detached_inner.items():
+                setattr(inner_model, attr, val)
+
+            # Share by reference on self.ref_model
+            for attr, val in detached_attrs.items():
+                setattr(self.ref_model, attr, val)
+            inner_ref = self.ref_model.get_model() if hasattr(self.ref_model, 'get_model') else self.ref_model
+            for attr, val in detached_inner.items():
+                setattr(inner_ref, attr, val)
+
+            # Put on the same GPU device as policy model
+            self.ref_device = self.args.device
             self.ref_model.requires_grad_(False).eval()
-            self.ref_model.to('cpu')  # only the (small) LLM backbone now; parked on CPU
+            self.ref_model.to(self.ref_device)
+            
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -454,11 +475,6 @@ class LLaVATrainer(Trainer):
 
                 # Log probabilities under reference policy (no gradient - for KL penalty)
                 rd = self.args.device
-                inner_ref = self.ref_model.get_model() if hasattr(self.ref_model, 'get_model') else self.ref_model
-                inner_model = self.model.get_model() if hasattr(self.model, 'get_model') else self.model
-                self.ref_model.to(rd)  # moves only the LLM backbone (small); shared attrs are still None
-                for attr in self._ref_shared_attrs:
-                    setattr(inner_ref, attr, getattr(inner_model, attr))  # borrow self.model's GPU copies
                 with self.compute_loss_context_manager():
                     ref_outputs = self.ref_model(
                         input_ids=output_ids.to(rd),
@@ -469,10 +485,6 @@ class LLaVATrainer(Trainer):
                 ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
                 ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_ids.to(rd).unsqueeze(-1)).squeeze(-1).to(device)
                 del ref_outputs, ref_log_probs
-                gc.collect()
-                for attr in self._ref_shared_attrs:
-                    setattr(inner_ref, attr, None)  # release borrowed refs before offloading
-                self.ref_model.to('cpu')
                 torch.cuda.empty_cache()
                 gc.collect()
 

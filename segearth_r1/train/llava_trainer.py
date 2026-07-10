@@ -436,10 +436,6 @@ class LLaVATrainer(Trainer):
                         refer_embedding_indices=refer_embedding_indices_full_batched
                     )
                 ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
-
-                
-                ref_logits_all = torch.cat(ref_log_probs_list, dim=0)  # [G, total_len, vocab_size]
-                ref_log_probs = torch.nn.functional.log_softmax(ref_logits_all, dim=-1)
                 ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1)
 
                 rollouts.append({

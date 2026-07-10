@@ -266,15 +266,17 @@ class MSDeformAttnPixelDecoder(nn.Module): # MSDeformAttnPixelDecoder
         self.output_convs = output_convs[::-1]
 
     def forward_features(self, features): # features: {"res2": [batch_size, 128, H / 4 (128), W / 4 (128)], "res3": [batch_size, 256, H / 8 (64), W / 8 (64)], "res4": [batch_size, 512, H / 16 (32), W / 16 (32)], "res5": [batch_size, 1024, H / 32 (16), W / 32 (16)]}
-        features = {k: v.float() for k, v in features.items()}
         srcs = []
         pos = []
         # Reverse feature maps into top-down order (from low to high resolution), 'res5' -> 'res3'
         for idx, f in enumerate(self.transformer_in_features[::-1]): # self.transformer_in_features: ["res3", "res4", "res5"]
-            # x = features[f].float()  # deformable detr does not support half precision
             x = features[f] 
-            srcs.append(self.input_proj[idx](x))
-            pos.append(self.pe_layer(x).to(x.dtype))
+            proj = self.input_proj[idx]
+            proj_dtype = proj.weight.dtype if hasattr(proj, "weight") else x.dtype
+            x = x.to(dtype=proj_dtype)
+            proj_out = proj(x)
+            srcs.append(proj_out.float())
+            pos.append(self.pe_layer(x).float())
         # srcs: [[batch_size, 256, 32, 32], [batch_size, 256, 64, 64], [batch_size, 256, 128, 128]] pos: [[batch_size, 256, 32, 32], [batch_size, 256, 64, 64], [batch_size, 256, 128, 128]] pos和scrs的形状相同
         y, spatial_shapes, level_start_index = self.transformer(srcs, pos) # 后三层
         bs = y.shape[0]
@@ -302,9 +304,16 @@ class MSDeformAttnPixelDecoder(nn.Module): # MSDeformAttnPixelDecoder
             x = features[f] # [batch_size, 128, H / 4 (256), W / 4 (256)]
             lateral_conv = self.lateral_convs[idx]
             output_conv = self.output_convs[idx]
+            
+            lat_dtype = lateral_conv.weight.dtype if hasattr(lateral_conv, "weight") else x.dtype
+            x = x.to(dtype=lat_dtype)
             cur_fpn = lateral_conv(x) # [2, 256, 256, 256]
+            
             # Following FPN implementation, we use nearest upsampling here
-            y = cur_fpn + F.interpolate(out[-1].float(), size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False).to(x.dtype)
+            y = cur_fpn + F.interpolate(out[-1].float(), size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False).to(cur_fpn.dtype)
+            
+            out_dtype = output_conv.weight.dtype if hasattr(output_conv, "weight") else y.dtype
+            y = y.to(dtype=out_dtype)
             y = output_conv(y)
             out.append(y)
 
@@ -313,4 +322,9 @@ class MSDeformAttnPixelDecoder(nn.Module): # MSDeformAttnPixelDecoder
                 multi_scale_features.append(o)
                 num_cur_levels += 1
         # multi_scale_features: [[batch_size, 256, 32, 32], [batch_size, 256, 64, 64], [batch_size, 256, 128, 128]]
-        return self.mask_features(out[-1]), out[0], multi_scale_features
+        
+        mask_feat_layer = self.mask_features
+        mask_feat_dtype = mask_feat_layer.weight.dtype if hasattr(mask_feat_layer, "weight") else out[-1].dtype
+        mask_features_out = mask_feat_layer(out[-1].to(dtype=mask_feat_dtype))
+        
+        return mask_features_out, out[0], multi_scale_features

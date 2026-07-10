@@ -324,17 +324,18 @@ class LLaVATrainer(Trainer):
                 self.model.forward = types.MethodType(type(self.model).forward, self.model)
                 images_batched = images_batched.to(dtype=next(self.model.get_model().get_vision_tower().parameters()).dtype)
                 try:
-                    outputs = self.model.generate(
-                        input_ids=prompt_ids_batched,
-                        attention_mask=attention_mask_batched,
-                        images=images_batched,
-                        token_refer_id=token_refer_id_batched,
-                        refer_embedding_indices=refer_embedding_indices_prompt_batched,
-                        do_sample=True,
-                        temperature=1.0,
-                        max_new_tokens=64,
-                        return_dict_in_generate=True,
-                    )
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        outputs = self.model.generate(
+                            input_ids=prompt_ids_batched,
+                            attention_mask=attention_mask_batched,
+                            images=images_batched,
+                            token_refer_id=token_refer_id_batched,
+                            refer_embedding_indices=refer_embedding_indices_prompt_batched,
+                            do_sample=True,
+                            temperature=1.0,
+                            max_new_tokens=64,
+                            return_dict_in_generate=True,
+                        )
                 finally:
                     if _had_forward_override:
                         self.model.forward = _prev_forward

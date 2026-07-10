@@ -230,12 +230,15 @@ def evaluation():
                 from segearth_r1.eval_and_test.inference_scaling import (
                     parallel_scale_reasoning,
                     sequential_scale_reasoning,
-                    parallel_scale_referring
+                    parallel_scale_referring,
+                    make_iou_oracle
                 )
                 outputs = []
                 # Process each item in the batch sequentially for ensembling
                 for b_idx in range(inputs['images'].shape[0]):
                     image_tensor = inputs['images'][b_idx:b_idx+1]
+                    gt_mask_item = gt[b_idx].to(device)
+                    oracle_iou_fn = make_iou_oracle(gt_mask_item)
                     
                     if data_args.scaling_type == "parallel_reasoning":
                         # Decode the pre-tokenized target question back into text
@@ -245,7 +248,8 @@ def evaluation():
                         scaled_res = parallel_scale_reasoning(
                             model, tokenizer, image_tensor, question,
                             n=data_args.scaling_n, temperature=data_args.scaling_temp,
-                            aggregator=data_args.scaling_aggregator, device=device
+                            aggregator=data_args.scaling_aggregator, device=device,
+                            oracle_iou_fn=oracle_iou_fn
                         )
                         # Format output to match the structure compute_metric expects
                         outputs.append({"pred_masks": scaled_res["mask"].cuda(), "scores": None})
@@ -257,7 +261,7 @@ def evaluation():
                         scaled_res = sequential_scale_reasoning(
                             model, tokenizer, image_tensor, question,
                             max_rounds=data_args.scaling_n, temperature=data_args.scaling_temp,
-                            device=device
+                            device=device, oracle_iou_fn=oracle_iou_fn
                         )
                         outputs.append({"pred_masks": scaled_res["mask"].cuda(), "scores": None})
                         
@@ -276,7 +280,8 @@ def evaluation():
                             aggregator=data_args.scaling_aggregator,
                             flip_prob=data_args.flip_prob,
                             referring_text=referring_text,
-                            device=device
+                            device=device,
+                            oracle_iou_fn=oracle_iou_fn
                         )
                         outputs.append({"pred_masks": scaled_res["mask"].cuda(), "scores": None})
             else:

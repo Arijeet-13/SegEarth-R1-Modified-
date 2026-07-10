@@ -367,7 +367,7 @@ class LLaVATrainer(Trainer):
                 outputs_seg = self.model.eval_seg(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
-                    images=batch["images"].float(),
+                    images=batch["images"].to(dtype=next(self.model.get_model().get_vision_tower().parameters()).dtype),
                     masks=None,
                     token_refer_id=batch["token_refer_id"],
                     refer_embedding_indices=batch["refer_embedding_indices"],

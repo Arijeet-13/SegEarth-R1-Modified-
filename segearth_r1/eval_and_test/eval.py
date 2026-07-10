@@ -165,6 +165,7 @@ class DataArguments:
     # parallel_referring: Determines how many image resolutions/scales to process in TTA.
     scaling_temp: float = field(default=1.0) #Amount of variation in the generated samples.
     scaling_aggregator: str = field(default="average")       # 'average', 'majority_vote', or 'best_of_n'
+    flip_prob: float = field(default=0.5, metadata={"help": "Probability of horizontal flip for test-time augmentation (TTA) in referring segmentation."})
 
 def evaluation():
     parser = transformers.HfArgumentParser(DataArguments)
@@ -261,6 +262,9 @@ def evaluation():
                         outputs.append({"pred_masks": scaled_res["mask"].cuda(), "scores": None})
                         
                     elif data_args.scaling_type == "parallel_referring":
+                        question_ids = inputs['token_refer_id'][b_idx]
+                        referring_text = tokenizer.decode(question_ids, skip_special_tokens=True).strip()
+                        
                         scaled_res = parallel_scale_referring(
                             model, tokenizer, image_tensor,
                             input_ids=inputs['input_ids'][b_idx:b_idx+1],
@@ -269,7 +273,10 @@ def evaluation():
                             refer_embedding_indices=inputs['refer_embedding_indices'][b_idx:b_idx+1],
                             labels=inputs['labels'][b_idx:b_idx+1],
                             n=data_args.scaling_n,
-                            aggregator=data_args.scaling_aggregator
+                            aggregator=data_args.scaling_aggregator,
+                            flip_prob=data_args.flip_prob,
+                            referring_text=referring_text,
+                            device=device
                         )
                         outputs.append({"pred_masks": scaled_res["mask"].cuda(), "scores": None})
             else:

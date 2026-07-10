@@ -212,25 +212,9 @@ class LLaVATrainer(Trainer):
         num_steps = len(train_dl) * int(self.args.num_train_epochs) * ppo_epochs
         
         if not hasattr(self, 'ref_model'):
-            self.ref_device = torch.device('cuda:1') if torch.cuda.device_count() > 1 else self.args.device
-            self.ref_model = copy.deepcopy(self.model)
-            if self.ref_device == self.args.device:
-                # Same GPU: share the heavy submodules by reference to avoid a second copy.
-                if hasattr(self.model, 'get_model') and hasattr(self.model.get_model(), 'predictor'):
-                    self.ref_model.get_model().predictor = self.model.get_model().predictor
-                    self.ref_model.get_model().pixel_decoder = self.model.get_model().pixel_decoder
-                else:
-                    self.ref_model.predictor = self.model.predictor
-                    self.ref_model.pixel_decoder = self.model.pixel_decoder
-                if getattr(self.args, "train_backbone", False) is False:
-                    self.ref_model.get_model().vision_tower = self.model.get_model().vision_tower
+            self.ref_device = torch.device('cuda:1') if torch.cuda.device_count() > 1 else torch.device('cpu')
+            self.ref_model = copy.deepcopy(self.model).to(self.ref_device)
             self.ref_model.requires_grad_(False).eval()
-            self.ref_model.to(self.ref_device)
-            # The deepcopy above briefly allocated its own copies of the (large)
-            # vision_tower/predictor/pixel_decoder weights before we replaced them
-            # with shared references above. Force those orphaned CUDA tensors to be
-            # released back to the allocator now instead of leaving a memory spike
-            # sitting around when we hit generate() a few lines later.
             gc.collect()
             torch.cuda.empty_cache()
 

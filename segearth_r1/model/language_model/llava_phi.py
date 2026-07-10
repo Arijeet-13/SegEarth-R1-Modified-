@@ -207,11 +207,21 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
 
     # def mask_token_processor()
 
-    def get_vision_tower_feature(self, images):
+    def run_vision_tower(self, images):
         if getattr(self, '_cached_raw_features', None) is None:
             with torch.no_grad():
-                self._cached_raw_features = self.get_model().get_vision_tower()(images)
-        features = self._cached_raw_features
+                if isinstance(images, torch.Tensor) and images.dim() == 4 and images.shape[0] > 1 and torch.equal(images[0:1].expand_as(images), images):
+                    # GRPO rollout: batch is G copies of one image — run backbone once
+                    raw = self.get_model().get_vision_tower()(images[0:1])
+                    self._cached_raw_features = tuple(
+                        f.repeat(images.shape[0], *([1] * (f.dim() - 1))) for f in raw
+                    )
+                else:
+                    self._cached_raw_features = self.get_model().get_vision_tower()(images)
+        return self._cached_raw_features
+
+    def get_vision_tower_feature(self, images):
+        features = self.run_vision_tower(images)
         features_dict = {
             'res2': features[0],
             'res3': features[1],
@@ -275,10 +285,8 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             "scores": scores,
         }
     def encode_images(self, images):
-        if getattr(self, '_cached_raw_features', None) is None:
-            with torch.no_grad():
-                self._cached_raw_features = self.get_model().get_vision_tower()(images)
-        image_features = self.get_model().mm_projector(self._cached_raw_features)
+        raw_features = self.run_vision_tower(images)
+        image_features = self.get_model().mm_projector(raw_features)
         return image_features
 
     def predictor_init(self, cfg):

@@ -309,7 +309,7 @@ class LLaVATrainer(Trainer):
                     prompt_ref_indices = None
                     refer_embedding_indices_prompt_batched = None
 
-                # 1. Sample G candidate reasoning paths from active policy (no grads)
+            # 1. Sample G candidate reasoning paths from active policy (no grads)
                 attention_mask_batched = torch.ones_like(prompt_ids_batched)
                 with self.compute_loss_context_manager():
                     outputs = self.model.generate(
@@ -325,6 +325,18 @@ class LLaVATrainer(Trainer):
                     )
 
                 output_ids = outputs.sequences  # [G, total_len]
+
+                
+                # Pad all sequences in the group to the maximum length
+                max_len = max(seq.shape[0] for seq in outputs_list)
+                padded_outputs = []
+                for seq in outputs_list:
+                    if seq.shape[0] < max_len:
+                        padding = torch.full((max_len - seq.shape[0],), pad_token_id, dtype=seq.dtype, device=seq.device)
+                        seq = torch.cat([seq, padding], dim=0)
+                    padded_outputs.append(seq)
+                
+                output_ids = torch.stack(padded_outputs, dim=0)  # [G, max_len]
                 gen_ids = output_ids[:, prompt_ids.size(0):]  # [G, gen_len]
                 gen_len = gen_ids.shape[1]
 
@@ -345,7 +357,6 @@ class LLaVATrainer(Trainer):
                 batch["token_refer_id"] = [t.to(device) for t in batch["token_refer_id"]]
                 batch["token_answer_id"] = [t.to(device) for t in batch["token_answer_id"]]
 
-                # Predict masks
                 outputs_seg = self.model.eval_seg(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
@@ -425,6 +436,10 @@ class LLaVATrainer(Trainer):
                         refer_embedding_indices=refer_embedding_indices_full_batched
                     )
                 ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
+
+                
+                ref_logits_all = torch.cat(ref_log_probs_list, dim=0)  # [G, total_len, vocab_size]
+                ref_log_probs = torch.nn.functional.log_softmax(ref_logits_all, dim=-1)
                 ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1)
 
                 rollouts.append({
@@ -445,8 +460,8 @@ class LLaVATrainer(Trainer):
         total_loss_accumulated = 0.0
         
         for rollout in rollouts:
-            output_ids = rollout["output_ids"]
-            gen_ids = rollout["gen_ids"]
+            output_ids = rollout["output_ids"]                    # [G, total_len]
+            gen_ids = rollout["gen_ids"]                          # [G, gen_len]
             gen_len = rollout["gen_len"]
             images_batched = rollout["images_batched"]
             token_refer_id_batched = rollout["token_refer_id_batched"]
@@ -464,7 +479,7 @@ class LLaVATrainer(Trainer):
                     refer_embedding_indices=refer_embedding_indices_full_batched
                 ).logits
             new_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1)
-            
+
             # Ratio has active gradients through new_logp
             ratio = torch.exp(new_logp - old_logp)
 

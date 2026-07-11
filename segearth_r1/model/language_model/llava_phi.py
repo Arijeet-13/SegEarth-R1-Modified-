@@ -120,12 +120,11 @@ class segearth_r1Model(LlavaMetaModel, PhiModel):
 class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaConfig
 
-    def __init__(self, config, mask_decoder_cfg=None, add_cross_attn=True, cross_attn_index=None, use_seg_query=False, use_multiscale_seg=True):
+    def __init__(self, config, mask_decoder_cfg=None, add_cross_attn=True, cross_attn_index=None, use_seg_query=False):
         super(segearth_r1, self).__init__(config)
 
         self.model = segearth_r1Model(config, mask_decoder_cfg)
         self.use_seg_query = use_seg_query
-        self.use_multiscale_seg = use_multiscale_seg  # Toggle for multi-scale SEG embedding
         self.init_config = config
         self.mask_decoder_cfg = mask_decoder_cfg
         self.cross_attn_index = cross_attn_index
@@ -139,12 +138,9 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         self.refer_pooling = nn.AdaptiveAvgPool1d(output_size=1)
         additional_dim = 512
         local_fea_dim = [128 * 2**i for i in [0, 1, 2, 3]]
-        self.local_project_res3 = nn.Linear(local_fea_dim[1], additional_dim)  # 256 → 512
-        self.local_project_res4 = nn.Linear(local_fea_dim[2], additional_dim)  # 512 → 512
-        self.local_project_res5 = nn.Linear(local_fea_dim[3], additional_dim)  # 1024 → 512
-        self.local_project = nn.Linear(local_fea_dim[-1], additional_dim)
         self.text_projector = nn.Linear(self.config.hidden_size, additional_dim)
         self.origin_SEG_token_projector = nn.Linear(self.config.hidden_size, additional_dim)
+        self.local_project = nn.Linear(local_fea_dim[-1], additional_dim)
         self.SEG_token_projector = nn.Linear(2 * additional_dim, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
         self.d_layers = D_Projector(dim=additional_dim, depth=1, dim_head=64, heads=8, ff_mult=1)       
         
@@ -165,9 +161,6 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         input_shape = self.output_shape() # 这是一个函数
         self.pixel_decoder = self.pixel_decoder_init(cfg=self.mask_decoder_cfg, input_shape=input_shape) # 初始化pixel_decoder
         self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
-        # Initialize new projectors with Xavier uniform
-        nn.init.xavier_uniform_(self.local_project_res3.weight)
-        nn.init.xavier_uniform_(self.local_project_res4.weight)
 
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
@@ -1132,7 +1125,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             SEG_embedding = self.get_SEG_embedding(hidden_states, refer_embedding_indices, return_all = True)
             origin_SEG_embedding = torch.cat([self.origin_SEG_token_projector(kk.unsqueeze(0)[:, 0:1]) for kk in SEG_embedding])
             local_vision = image_features["res5"].flatten(2).permute(0, 2, 1)
-            local_vision = self.local_project(local_vision.to(dtype=self.local_project.weight.dtype))
+            local_vision = self.local_project(local_vision)
             new_SEG_embedding = []
             for batch_idx, cur_SEG_embedding in enumerate(SEG_embedding):
                 cur_SEG_embedding = self.text_projector(cur_SEG_embedding.unsqueeze(0))

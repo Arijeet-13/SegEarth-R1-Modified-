@@ -145,9 +145,8 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         self.local_project = nn.Linear(local_fea_dim[-1], additional_dim)
         self.text_projector = nn.Linear(self.config.hidden_size, additional_dim)
         self.origin_SEG_token_projector = nn.Linear(self.config.hidden_size, additional_dim)
-        self.local_project = nn.Linear(local_fea_dim[-1], additional_dim)
         self.SEG_token_projector = nn.Linear(2 * additional_dim, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
-        self.d_layers = D_Projector(dim=additional_dim, depth=2, dim_head=64, heads=8, ff_mult=1)       
+        self.d_layers = D_Projector(dim=additional_dim, depth=1, dim_head=64, heads=8, ff_mult=1)       
         
         if is_train_mask_decode:
             print('Mask Decoder has been trained, init directly')

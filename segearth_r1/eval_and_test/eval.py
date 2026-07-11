@@ -233,6 +233,9 @@ def evaluation():
         for idx, inputs in tqdm(enumerate(eval_dataloader), total=len(eval_dataloader)):
             gt = inputs["masks"]
             inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
+            # Cast images to model dtype
+            if 'images' in inputs:
+                inputs['images'] = inputs['images'].to(dtype=eval_dtype)
             inputs['token_refer_id'] = [ids.to(device) for ids in inputs['token_refer_id']]
             if getattr(data_args, 'scaling_type', None) is not None:
                 from segearth_r1.eval_and_test.inference_scaling import (

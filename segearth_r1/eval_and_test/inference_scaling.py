@@ -200,7 +200,6 @@ def predict_masks_given_answers(
         labels=batch["labels"],
         token_answer_id=batch["token_answer_id"],
         answer_embedding_indices=batch["answer_embedding_indices"],
-        _reuse_vision_cache=True,
     )
 
     results = []

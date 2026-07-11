@@ -906,8 +906,8 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 mask_loss = loss_mask + loss_dice + loss_SEG_class
                 if isinstance(loss_SEG_class, float):
                     loss_SEG_class = torch.tensor(loss_SEG_class, device=mask_loss.device)
-                # if batch_dataset_type == 'refer_seg':
-                #     llm_loss = torch.tensor(0.0, device=mask_loss.device)
+                if batch_dataset_type == 'refer_seg':
+                    llm_loss = torch.tensor(0.0, device=mask_loss.device)
             loss = llm_loss + mask_loss
                 
         if batch_dataset_type == 'mm_conv':

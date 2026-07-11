@@ -842,6 +842,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         token_answer_id: Optional[int] = None,
         refer_embedding_indices: Optional[List[int]] = None,
         answer_embedding_indices: Optional[List[int]] = None,
+        target_group_ids: Optional[torch.LongTensor] = None,  # For multi-target: group ID per token
         dataset_type: Optional[str] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
@@ -913,37 +914,107 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                     # Standard refer_seg or fallback
                     seg_indices = refer_embedding_indices
                     
-                SEG_embedding = self.get_SEG_embedding(hidden_states, seg_indices, return_all = True)
-                origin_SEG_embedding = torch.cat([self.origin_SEG_token_projector(kk.unsqueeze(0)[:, 0:1]) for kk in SEG_embedding])
-                local_vision = image_features["res5"].flatten(2).permute(0, 2, 1)
-                local_vision = self.local_project(local_vision)   
-                new_SEG_embedding = []
-                for batch_idx, cur_SEG_embedding in enumerate(SEG_embedding):
-                    cur_SEG_embedding = self.text_projector(cur_SEG_embedding.unsqueeze(0))
-                    cur_SEG_embedding = self.d_layers(latents=cur_SEG_embedding.unsqueeze(1), 
-                        x=local_vision[batch_idx:batch_idx+1].unsqueeze(1))
-                    new_SEG_embedding.append(cur_SEG_embedding)
-                new_SEG_embedding = torch.cat(new_SEG_embedding, dim=0)
-                SEG_embedding = torch.cat((origin_SEG_embedding, new_SEG_embedding), dim=-1)
-                SEG_embedding = self.SEG_token_projector(SEG_embedding) 
+                SEG_embedding = self.get_SEG_embedding(hidden_states, seg_indices, return_all=True, target_group_ids=target_group_ids)
+                
+                # Handle multi-target vs single-target outputs
+                if self.use_multi_target_seg and target_group_ids is not None:
+                    # Multi-target mode: SEG_embedding is list of [num_targets, hidden_dim] per sample
+                    # Process each sample's targets
+                    all_target_embeddings = []
+                    for batch_idx, cur_target_embeddings in enumerate(SEG_embedding):
+                        # cur_target_embeddings: [num_targets, hidden_dim]
+                        batch_target_list = []
+                        for target_idx in range(cur_target_embeddings.shape[0]):
+                            cur_target_emb = cur_target_embeddings[target_idx:target_idx+1]  # [1, hidden_dim]
+                            origin_emb = self.origin_SEG_token_projector(cur_target_emb)
+                            text_emb = self.text_projector(cur_target_emb.unsqueeze(0))
+                            fused_emb = self.d_layers(latents=text_emb.unsqueeze(1),
+                                                     x=local_vision[batch_idx:batch_idx+1].unsqueeze(1))
+                            final_emb = torch.cat((origin_emb, fused_emb), dim=-1)
+                            final_emb = self.SEG_token_projector(final_emb)
+                            batch_target_list.append(final_emb)
+                        all_target_embeddings.append(torch.cat(batch_target_list, dim=0))
+                    SEG_embedding = all_target_embeddings  # List of [num_targets, hidden_dim]
+                else:
+                    # Single-target mode (original behavior)
+                    origin_SEG_embedding = torch.cat([self.origin_SEG_token_projector(kk.unsqueeze(0)[:, 0:1]) for kk in SEG_embedding])
+                    local_vision = image_features["res5"].flatten(2).permute(0, 2, 1)
+                    local_vision = self.local_project(local_vision)   
+                    new_SEG_embedding = []
+                    for batch_idx, cur_SEG_embedding in enumerate(SEG_embedding):
+                        cur_SEG_embedding = self.text_projector(cur_SEG_embedding.unsqueeze(0))
+                        cur_SEG_embedding = self.d_layers(latents=cur_SEG_embedding.unsqueeze(1), 
+                            x=local_vision[batch_idx:batch_idx+1].unsqueeze(1))
+                        new_SEG_embedding.append(cur_SEG_embedding)
+                    new_SEG_embedding = torch.cat(new_SEG_embedding, dim=0)
+                    SEG_embedding = torch.cat((origin_SEG_embedding, new_SEG_embedding), dim=-1)
+                    SEG_embedding = self.SEG_token_projector(SEG_embedding) 
             else:
                 SEG_embedding = None
 
-            mask_outputs = self.predictor(
-                    multi_scale_features, 
-                    mask_features, 
-                    None, 
-                    seg_query,
-                    SEG_embedding, 
-                    None)
+            # Call predictor - handles both single and multi-target
+            if self.use_multi_target_seg and isinstance(SEG_embedding, list):
+                # Multi-target: process each sample's targets separately
+                mask_outputs_list = []
+                for batch_idx, batch_seg_emb in enumerate(SEG_embedding):
+                    # batch_seg_emb: [num_targets, hidden_dim]
+                    batch_mask_feat = mask_features[batch_idx:batch_idx+1]
+                    batch_multi_scale = [feat[batch_idx:batch_idx+1] for feat in multi_scale_features]
+                    batch_seg_query = seg_query[batch_idx:batch_idx+1] if seg_query is not None else None
+                    
+                    batch_output = self.predictor(
+                        batch_multi_scale,
+                        batch_mask_feat,
+                        None,
+                        batch_seg_query,
+                        batch_seg_emb,  # [num_targets, hidden_dim]
+                        None
+                    )
+                    mask_outputs_list.append(batch_output)
+                mask_outputs = mask_outputs_list  # List of outputs per sample
+            else:
+                # Single-target (original behavior)
+                mask_outputs = self.predictor(
+                        multi_scale_features, 
+                        mask_features, 
+                        None, 
+                        seg_query,
+                        SEG_embedding, 
+                        None)
 
-            if masks is not None: 
+            if masks is not None:
+                # Build targets - support multi-target if masks is list of lists
                 targets = []
-                for mask in masks:
-                    target = {"labels": torch.tensor([1]), "masks": mask}
-                    targets.append(target)             
+                if self.use_multi_target_seg and isinstance(masks[0], (list, tuple)):
+                    # Multi-target: masks is list of lists [[mask1, mask2], [mask3], ...]
+                    for sample_masks in masks:
+                        sample_targets = []
+                        for mask in sample_masks:
+                            sample_targets.append({"labels": torch.tensor([1]), "masks": mask})
+                        targets.append(sample_targets)
+                else:
+                    # Single-target (original)
+                    for mask in masks:
+                        target = {"labels": torch.tensor([1]), "masks": mask}
+                        targets.append(target)
                 
-                mask_losses = self.criterion(mask_outputs, targets)
+                # Compute losses
+                if self.use_multi_target_seg and isinstance(mask_outputs, list):
+                    # Multi-target: aggregate losses across samples
+                    total_mask_losses = {}
+                    for sample_output, sample_targets in zip(mask_outputs, targets):
+                        sample_losses = self.criterion(sample_output, sample_targets if isinstance(sample_targets, list) else [sample_targets])
+                        for k, v in sample_losses.items():
+                            if k not in total_mask_losses:
+                                total_mask_losses[k] = v
+                            else:
+                                total_mask_losses[k] = total_mask_losses[k] + v
+                    # Average over samples
+                    mask_losses = {k: v / len(mask_outputs) for k, v in total_mask_losses.items()}
+                else:
+                    # Single-target (original)
+                    mask_losses = self.criterion(mask_outputs, targets)
+                
                 weight_dict = self.weight_dict
 
                 loss_mask = 0.0
@@ -1169,6 +1240,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         token_answer_id: Optional[torch.LongTensor] = None,
         refer_embedding_indices: Optional[torch.LongTensor] = None,
         answer_embedding_indices: Optional[torch.LongTensor] = None,
+        target_group_ids: Optional[torch.LongTensor] = None,  # Multi-target support
         is_thing_list: Optional[torch.Tensor] = None,
     ):
         # Vision features computed fresh per call (no persistent cache)
@@ -1210,51 +1282,117 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             # For GRPO: prefer answer_embedding_indices if available
             # Note: eval doesn't have batch_dataset_type, so we check answer_embedding_indices availability
             seg_indices = answer_embedding_indices if answer_embedding_indices is not None else refer_embedding_indices
-            SEG_embedding = self.get_SEG_embedding(hidden_states, seg_indices, return_all = True)
-            origin_SEG_embedding = torch.cat([self.origin_SEG_token_projector(kk.unsqueeze(0)[:, 0:1]) for kk in SEG_embedding])
-            local_vision = image_features["res5"].flatten(2).permute(0, 2, 1)
-            local_vision = self.local_project(local_vision)
-            new_SEG_embedding = []
-            for batch_idx, cur_SEG_embedding in enumerate(SEG_embedding):
-                cur_SEG_embedding = self.text_projector(cur_SEG_embedding.unsqueeze(0))
-                cur_SEG_embedding = self.d_layers(latents=cur_SEG_embedding.unsqueeze(1), 
-                    x=local_vision[batch_idx:batch_idx+1].unsqueeze(1))
-                new_SEG_embedding.append(cur_SEG_embedding)
-            new_SEG_embedding = torch.cat(new_SEG_embedding, dim=0)
-            SEG_embedding = torch.cat((origin_SEG_embedding, new_SEG_embedding), dim=-1)
-            SEG_embedding = self.SEG_token_projector(SEG_embedding)  
+            SEG_embedding = self.get_SEG_embedding(hidden_states, seg_indices, return_all=True, target_group_ids=target_group_ids)
+            
+            # Handle multi-target vs single-target outputs
+            if self.use_multi_target_seg and target_group_ids is not None:
+                # Multi-target mode: SEG_embedding is list of [num_targets, hidden_dim] per sample
+                all_target_embeddings = []
+                for batch_idx, cur_target_embeddings in enumerate(SEG_embedding):
+                    batch_target_list = []
+                    for target_idx in range(cur_target_embeddings.shape[0]):
+                        cur_target_emb = cur_target_embeddings[target_idx:target_idx+1]
+                        origin_emb = self.origin_SEG_token_projector(cur_target_emb)
+                        text_emb = self.text_projector(cur_target_emb.unsqueeze(0))
+                        fused_emb = self.d_layers(latents=text_emb.unsqueeze(1),
+                                                 x=local_vision[batch_idx:batch_idx+1].unsqueeze(1))
+                        final_emb = torch.cat((origin_emb, fused_emb), dim=-1)
+                        final_emb = self.SEG_token_projector(final_emb)
+                        batch_target_list.append(final_emb)
+                    all_target_embeddings.append(torch.cat(batch_target_list, dim=0))
+                SEG_embedding = all_target_embeddings
+            else:
+                # Single-target (original)
+                origin_SEG_embedding = torch.cat([self.origin_SEG_token_projector(kk.unsqueeze(0)[:, 0:1]) for kk in SEG_embedding])
+                local_vision = image_features["res5"].flatten(2).permute(0, 2, 1)
+                local_vision = self.local_project(local_vision)
+                new_SEG_embedding = []
+                for batch_idx, cur_SEG_embedding in enumerate(SEG_embedding):
+                    cur_SEG_embedding = self.text_projector(cur_SEG_embedding.unsqueeze(0))
+                    cur_SEG_embedding = self.d_layers(latents=cur_SEG_embedding.unsqueeze(1), 
+                        x=local_vision[batch_idx:batch_idx+1].unsqueeze(1))
+                    new_SEG_embedding.append(cur_SEG_embedding)
+                new_SEG_embedding = torch.cat(new_SEG_embedding, dim=0)
+                SEG_embedding = torch.cat((origin_SEG_embedding, new_SEG_embedding), dim=-1)
+                SEG_embedding = self.SEG_token_projector(SEG_embedding)  
         else:
             SEG_embedding = None
 
-        mask_outputs = self.predictor(
-                multi_scale_features, 
-                mask_features, 
-                None, 
-                seg_query,
-                SEG_embedding, 
-                None)
+        # Call predictor - handles both single and multi-target
+        if self.use_multi_target_seg and isinstance(SEG_embedding, list):
+            # Multi-target: process per sample
+            mask_outputs_list = []
+            for batch_idx, batch_seg_emb in enumerate(SEG_embedding):
+                batch_mask_feat = mask_features[batch_idx:batch_idx+1]
+                batch_multi_scale = [feat[batch_idx:batch_idx+1] for feat in multi_scale_features]
+                batch_seg_query = seg_query[batch_idx:batch_idx+1] if seg_query is not None else None
+                
+                batch_output = self.predictor(
+                    batch_multi_scale,
+                    batch_mask_feat,
+                    None,
+                    batch_seg_query,
+                    batch_seg_emb,
+                    None
+                )
+                mask_outputs_list.append(batch_output)
+            
+            # Aggregate results from all samples
+            SEG_cls_results = []
+            mask_pred_results = []
+            for output in mask_outputs_list:
+                SEG_cls_results.append(output['pred_SEG_logits'])
+                mask_pred = F.interpolate(
+                    output["pred_masks"],
+                    size=(images.shape[-2], images.shape[-1]),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                mask_pred_results.append(mask_pred)
+        else:
+            # Single-target (original)
+            mask_outputs = self.predictor(
+                    multi_scale_features, 
+                    mask_features, 
+                    None, 
+                    seg_query,
+                    SEG_embedding, 
+                    None)
 
-        SEG_cls_results = mask_outputs['pred_SEG_logits']
-        mask_pred_results = mask_outputs["pred_masks"]
-        mask_pred_results = F.interpolate(
-            mask_pred_results,
-            size=(images.shape[-2], images.shape[-1]),
-            mode="bilinear",
-            align_corners=False,
-        )
-        del mask_outputs
+            SEG_cls_results = mask_outputs['pred_SEG_logits']
+            mask_pred_results = mask_outputs["pred_masks"]
+            mask_pred_results = F.interpolate(
+                mask_pred_results,
+                size=(images.shape[-2], images.shape[-1]),
+                mode="bilinear",
+                align_corners=False,
+            )
+            del mask_outputs
         
         processed_results = []
-        if SEG_cls_results is None:
-            SEG_cls_results = [None] * mask_pred_results.shape[0]
-        for SEG_cls_result, mask_pred_result in zip(SEG_cls_results, mask_pred_results): 
-            if SEG_cls_result is not None:
-                SEG_cls_result = SEG_cls_result.to(mask_pred_result)
-            if SEG_cls_result is None:
-                results = self.SEG_instance_inference(None, mask_pred_result.float())
-            else:
-                results = self.SEG_instance_inference(SEG_cls_result.float(), mask_pred_result.float())
-            processed_results.append(results)
+        # Handle multi-target list format vs single-target tensor
+        if self.use_multi_target_seg and isinstance(mask_pred_results, list):
+            # Multi-target: each element is one sample's predictions
+            for sample_cls, sample_mask in zip(SEG_cls_results, mask_pred_results):
+                if sample_cls is not None:
+                    sample_cls = sample_cls.to(sample_mask)
+                if sample_cls is None:
+                    results = self.SEG_instance_inference(None, sample_mask.float())
+                else:
+                    results = self.SEG_instance_inference(sample_cls.float(), sample_mask.float())
+                processed_results.append(results)
+        else:
+            # Single-target (original)
+            if SEG_cls_results is None:
+                SEG_cls_results = [None] * mask_pred_results.shape[0]
+            for SEG_cls_result, mask_pred_result in zip(SEG_cls_results, mask_pred_results): 
+                if SEG_cls_result is not None:
+                    SEG_cls_result = SEG_cls_result.to(mask_pred_result)
+                if SEG_cls_result is None:
+                    results = self.SEG_instance_inference(None, mask_pred_result.float())
+                else:
+                    results = self.SEG_instance_inference(SEG_cls_result.float(), mask_pred_result.float())
+                processed_results.append(results)
             
         return processed_results
 

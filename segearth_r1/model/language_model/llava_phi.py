@@ -739,6 +739,18 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
     def get_SEG_embedding(self,hidden_states, refer_embedding_indices, return_all=False):
         refer_embedding_list = []
         for current_hidden_state, current_token_indice in zip(hidden_states, refer_embedding_indices):
+            # Guard against empty selection (SEG token truncated/missing)
+            if current_token_indice.sum() == 0:
+                # Return zero embedding to avoid NaN from pooling empty tensor
+                empty_embedding = torch.zeros(1, current_hidden_state.shape[-1], 
+                                             device=current_hidden_state.device, 
+                                             dtype=current_hidden_state.dtype)
+                if return_all:
+                    refer_embedding_list.append(empty_embedding)
+                else:
+                    refer_embedding_list.append(empty_embedding)
+                continue
+                
             current_refer_state = current_hidden_state[current_token_indice.bool()]
             current_pool_refer_state = self.refer_pooling(current_refer_state.transpose(-2, -1)).transpose(-2, -1)
             if return_all:
@@ -828,7 +840,19 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
                 image_features)
             if refer_embedding_indices is not None:
-                SEG_embedding = self.get_SEG_embedding(hidden_states, refer_embedding_indices, return_all = True)
+                # For reason_seg: use answer_embedding_indices ([SEG] in generated answer)
+                # For refer_seg: use refer_embedding_indices ([SEG] in instruction/question)
+                # For GRPO: prefer answer_embedding_indices if available
+                if batch_dataset_type == 'reason_seg' and answer_embedding_indices is not None:
+                    seg_indices = answer_embedding_indices
+                elif answer_embedding_indices is not None:
+                    # GRPO case: generated answer available
+                    seg_indices = answer_embedding_indices
+                else:
+                    # Standard refer_seg or fallback
+                    seg_indices = refer_embedding_indices
+                    
+                SEG_embedding = self.get_SEG_embedding(hidden_states, seg_indices, return_all = True)
                 origin_SEG_embedding = torch.cat([self.origin_SEG_token_projector(kk.unsqueeze(0)[:, 0:1]) for kk in SEG_embedding])
                 local_vision = image_features["res5"].flatten(2).permute(0, 2, 1)
                 local_vision = self.local_project(local_vision)   
@@ -879,7 +903,14 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 mask_loss = loss_mask + loss_dice + loss_SEG_class
                 if isinstance(loss_SEG_class, float):
                     loss_SEG_class = torch.tensor(loss_SEG_class, device=mask_loss.device)
-                if batch_dataset_type == 'refer_seg':
+            else:
+                # No masks provided - zero out mask loss to prevent NameError
+                mask_loss = torch.tensor(0.0, device=llm_loss.device)
+                loss_mask = torch.tensor(0.0, device=llm_loss.device)
+                loss_dice = torch.tensor(0.0, device=llm_loss.device)
+                loss_SEG_class = torch.tensor(0.0, device=llm_loss.device)
+                
+            if batch_dataset_type == 'refer_seg':
                     llm_loss = torch.tensor(0.0, device=mask_loss.device)
             loss = llm_loss + mask_loss
                 
@@ -1113,7 +1144,12 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             image_features)
 
         if refer_embedding_indices is not None:  
-            SEG_embedding = self.get_SEG_embedding(hidden_states, refer_embedding_indices, return_all = True)
+            # For reason_seg: use answer_embedding_indices ([SEG] in generated answer)
+            # For refer_seg: use refer_embedding_indices ([SEG] in instruction/question)  
+            # For GRPO: prefer answer_embedding_indices if available
+            # Note: eval doesn't have batch_dataset_type, so we check answer_embedding_indices availability
+            seg_indices = answer_embedding_indices if answer_embedding_indices is not None else refer_embedding_indices
+            SEG_embedding = self.get_SEG_embedding(hidden_states, seg_indices, return_all = True)
             origin_SEG_embedding = torch.cat([self.origin_SEG_token_projector(kk.unsqueeze(0)[:, 0:1]) for kk in SEG_embedding])
             local_vision = image_features["res5"].flatten(2).permute(0, 2, 1)
             local_vision = self.local_project(local_vision)

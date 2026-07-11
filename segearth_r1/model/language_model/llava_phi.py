@@ -268,17 +268,25 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         self.sem_seg_postprocess_before_inference =  True
     
     def SEG_instance_inference(self, SEG_cls, mask_pred):
-        image_size = mask_pred.shape[-2:] 
-        scores = F.sigmoid(SEG_cls) if SEG_cls else None
-        scores_per_image, topk_indices = scores.flatten(0, 1).topk(min(self.test_topk_per_image, scores.flatten(0, 1).shape[0]), sorted=False) if SEG_cls else None, None 
+        image_size = mask_pred.shape[-2:]
         if SEG_cls is not None:
+            scores = F.sigmoid(SEG_cls)
+            scores_per_image, topk_indices = scores.flatten(0, 1).topk(
+                min(self.test_topk_per_image, scores.flatten(0, 1).shape[0]), sorted=False
+            )
             mask_pred = mask_pred[topk_indices]
-        elif mask_pred.shape[0] == 1:
-            mask_pred = mask_pred[0]
+        else:
+            scores_per_image = None
+            topk_indices = None
+            if mask_pred.shape[0] == 1:
+                mask_pred = mask_pred[0]
         pred_masks = (mask_pred > 0).float()
-        mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * pred_masks.flatten(1)).sum(1) / (
-                pred_masks.flatten(1).sum(1) + 1e-6) if SEG_cls else None
-        scores = mask_scores_per_image * scores_per_image if SEG_cls else None
+        if SEG_cls is not None:
+            mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * pred_masks.flatten(1)).sum(1) / (
+                    pred_masks.flatten(1).sum(1) + 1e-6)
+            scores = mask_scores_per_image * scores_per_image
+        else:
+            scores = None
         return {
             "pred_masks": pred_masks,
             "raw_masks": mask_pred,
@@ -1114,8 +1122,12 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         refer_embedding_indices: Optional[torch.LongTensor] = None,
         answer_embedding_indices: Optional[torch.LongTensor] = None,
         is_thing_list: Optional[torch.Tensor] = None,
-    ):  
-        self._cached_raw_features = None
+        _reuse_vision_cache: bool = False,
+    ):
+        # Reset the vision-tower feature cache unless the caller explicitly wants to reuse it
+        # (e.g. parallel_scale_referring pre-populates the cache for a repeated image).
+        if not _reuse_vision_cache:
+            self._cached_raw_features = None
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

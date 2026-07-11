@@ -387,14 +387,14 @@ class ReasonSegDataset(Dataset):
         
         question_num = len(QAs["questions"])
         question_idx = random.randint(0, question_num - 1)
-        question = QAs["questions"][0]
+        question = QAs["questions"][question_idx]
         
         answer_num = len(QAs["answer"])
         if answer_num == 0:
             answer = "There is no target object in the image."
         else:
             answer_idx = random.randint(0, answer_num - 1)
-            answer = QAs["answer"][0]
+            answer = QAs["answer"][answer_idx]
         
         prefix_inst = 'This is an image <image>, Please doing Reasoning Segmentation according to the following instruction:'
         instruction = ' {}'.format(question)

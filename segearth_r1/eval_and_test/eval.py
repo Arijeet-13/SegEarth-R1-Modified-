@@ -166,6 +166,7 @@ class DataArguments:
     scaling_temp: float = field(default=1.0) #Amount of variation in the generated samples.
     scaling_aggregator: str = field(default="average")       # 'average', 'majority_vote', or 'best_of_n'
     flip_prob: float = field(default=0.5, metadata={"help": "Probability of horizontal flip for test-time augmentation (TTA) in referring segmentation."})
+    use_oracle: bool = field(default=False, metadata={"help": "If True, pass ground-truth IoU oracle to best_of_n/worst_of_n for upper-bound analysis. Never use for real benchmark numbers."})
 
 def evaluation():
     parser = transformers.HfArgumentParser(DataArguments)
@@ -238,7 +239,10 @@ def evaluation():
                 for b_idx in range(inputs['images'].shape[0]):
                     image_tensor = inputs['images'][b_idx:b_idx+1]
                     gt_mask_item = gt[b_idx].to(device)
-                    oracle_iou_fn = make_iou_oracle(gt_mask_item)
+                    # Only use the oracle IoU function for explicit upper-bound analysis.
+                    # Passing oracle_iou_fn when use_oracle=False would let best_of_n/worst_of_n
+                    # cheat by selecting candidates using ground-truth labels.
+                    oracle_iou_fn = make_iou_oracle(gt_mask_item) if data_args.use_oracle else None
                     
                     if data_args.scaling_type == "parallel_reasoning":
                         # Decode the pre-tokenized target question back into text

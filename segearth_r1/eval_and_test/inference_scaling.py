@@ -142,9 +142,10 @@ def _mask_confidence(result: dict) -> float:
     classifier head isn't active (e.g. seg_task == 'referring')."""
     scores = result.get("scores")
     if scores is not None and len(scores) > 0:
-        return float(scores.flatten()[0])
-    
-    # Expose and use raw_masks logits if available
+        # Use the maximum score across all candidate queries, not an arbitrary index
+        return float(scores.max())
+
+    # Fall back to mean sigmoid probability over foreground pixels in raw logits
     raw = result.get("raw_masks")
     if raw is not None:
         pred = raw[0] if raw.dim() == 3 else raw
@@ -185,6 +186,11 @@ def predict_masks_given_answers(
     batch["token_refer_id"] = [t.to(device) for t in batch["token_refer_id"]]
     batch["token_answer_id"] = [t.to(device) for t in batch["token_answer_id"]]
 
+    # Pre-warm the vision-tower cache with the single image so the backbone
+    # runs exactly once regardless of how many candidates are in the batch.
+    model._cached_raw_features = None
+    _ = model.run_vision_tower(batch["images"].float().to(device))
+
     outputs = model.eval_seg(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
@@ -195,6 +201,7 @@ def predict_masks_given_answers(
         labels=batch["labels"],
         token_answer_id=batch["token_answer_id"],
         answer_embedding_indices=batch["answer_embedding_indices"],
+        _reuse_vision_cache=True,
     )
 
     results = []
@@ -328,19 +335,22 @@ def sequential_scale_reasoning(
     device="cuda",
     oracle_iou_fn: Optional[Callable[[torch.Tensor], float]] = None,
     conv_version: str = "llava_phi",
+    max_history_turns: int = 4,
 ) -> dict:
     best_mask = None
     best_score = -1.0
-    
+
     conv = conversation_lib.conv_templates[conv_version].copy()
     history = []
 
     for r in range(max_rounds):
         critique = None if r == 0 else "Please reconsider your previous answer and provide a better one."
+        # Trim history to avoid exceeding context length: keep last max_history_turns pairs
+        trimmed_history = history[-(max_history_turns * 2):] if len(history) > max_history_turns * 2 else history
         answers = sample_reasoning_answers(
             model, tokenizer, image_tensor, question,
             n_samples=1, temperature=temperature, critique_prompt=critique,
-            history=history, conv_version=conv_version,
+            history=trimmed_history, conv_version=conv_version,
         )
         ans_text = answers[0]["text"]
         cands = predict_masks_given_answers(
@@ -352,7 +362,7 @@ def sequential_scale_reasoning(
         if score > best_score:
             best_score = score
             best_mask = c["mask"]
-            
+
         # Record the conversation turns into history for the next iteration round
         user_msg = f"{PREFIX_INST} {question}" if r == 0 else question
         if critique:
@@ -417,6 +427,8 @@ def parallel_scale_referring(
     images_batched = torch.cat(images_list, dim=0) # [n, 3, H, W]
 
     # Evaluate the batched candidates in a single pass
+    # Vision cache is not reused here since images may differ (flips).
+    # eval_seg will run the backbone once on the full batch.
     outputs = model.eval_seg(
         input_ids=input_ids,
         attention_mask=attention_mask,

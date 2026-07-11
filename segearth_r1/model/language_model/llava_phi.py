@@ -1078,11 +1078,8 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         refer_embedding_indices: Optional[torch.LongTensor] = None,
         answer_embedding_indices: Optional[torch.LongTensor] = None,
         is_thing_list: Optional[torch.Tensor] = None,
-        _reuse_vision_cache: bool = False,
     ):
-        # Reset the vision-tower feature cache unless the caller explicitly wants to reuse it
-        # (e.g. parallel_scale_referring pre-populates the cache for a repeated image).
-        if not _reuse_vision_cache:
+        # Vision features computed fresh per call (no persistent cache)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

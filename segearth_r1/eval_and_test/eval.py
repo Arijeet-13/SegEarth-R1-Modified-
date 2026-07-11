@@ -93,8 +93,10 @@ def compute_metric(intersection_meter, union_meter, acc_iou_meter, pr_meters, cu
         gt_mask = gt[i].squeeze(0).int().cuda().contiguous()
         pred_masks = result["pred_masks"].int().cuda().contiguous()
 
-        if result["scores"]:
-            scores = torch.tensor(result["scores"])
+        scores = result["scores"]
+        if scores is not None and len(scores) > 0:
+            # scores is already a Tensor from SEG_instance_inference — no need to re-wrap
+            scores = scores.detach().float() if isinstance(scores, torch.Tensor) else torch.tensor(scores, dtype=torch.float)
             top_idx = torch.topk(scores, 1).indices.cpu().numpy()
             preds_to_eval = pred_masks[top_idx, :]
         else:
@@ -185,24 +187,27 @@ def evaluation():
             tokenizer=tokenizer,
             split = data_args.data_split,
         )
-    if data_args.dataset_type == 'EarthReason':
+    elif data_args.dataset_type == 'EarthReason':
         eval_dataset = ReasonSegDataset(
             base_data_path=data_args.base_data_path,
             tokenizer=tokenizer,
             split=data_args.data_split,
         )
-    if data_args.dataset_type == 'Liss4Reason':
+    elif data_args.dataset_type == 'Liss4Reason':
         eval_dataset = Liss4ReasonSegDataset(
             base_data_path=data_args.base_data_path,
             tokenizer=tokenizer,
             split=data_args.data_split,
         )
-    if data_args.dataset_type == 'RefSegRS':
+    elif data_args.dataset_type == 'RefSegRS':
         eval_dataset = RefSegRSDataset(
             base_data_path=data_args.base_data_path,
             tokenizer=tokenizer,
             split=data_args.data_split,
         )
+    else:
+        raise ValueError(f"Unknown dataset_type: '{data_args.dataset_type}'. "
+                         f"Expected one of: RRSIS-D, EarthReason, Liss4Reason, RefSegRS")
     data_collator = DataCollector(
         tokenizer=tokenizer,
     )
@@ -245,9 +250,10 @@ def evaluation():
                     oracle_iou_fn = make_iou_oracle(gt_mask_item) if data_args.use_oracle else None
                     
                     if data_args.scaling_type == "parallel_reasoning":
-                        # Decode the pre-tokenized target question back into text
+                        # Decode the pre-tokenized question; drop the trailing [SEG] marker
+                        # that preprocess_referring_instruction always appends.
                         question_ids = inputs['token_refer_id'][b_idx]
-                        question = tokenizer.decode(question_ids, skip_special_tokens=True).strip()
+                        question = tokenizer.decode(question_ids[:-1], skip_special_tokens=True).strip()
                         
                         scaled_res = parallel_scale_reasoning(
                             model, tokenizer, image_tensor, question,
@@ -260,7 +266,7 @@ def evaluation():
                         
                     elif data_args.scaling_type == "sequential_reasoning":
                         question_ids = inputs['token_refer_id'][b_idx]
-                        question = tokenizer.decode(question_ids, skip_special_tokens=True).strip()
+                        question = tokenizer.decode(question_ids[:-1], skip_special_tokens=True).strip()
                         
                         scaled_res = sequential_scale_reasoning(
                             model, tokenizer, image_tensor, question,
@@ -271,7 +277,7 @@ def evaluation():
                         
                     elif data_args.scaling_type == "parallel_referring":
                         question_ids = inputs['token_refer_id'][b_idx]
-                        referring_text = tokenizer.decode(question_ids, skip_special_tokens=True).strip()
+                        referring_text = tokenizer.decode(question_ids[:-1], skip_special_tokens=True).strip()
                         
                         scaled_res = parallel_scale_referring(
                             model, tokenizer, image_tensor,
@@ -317,9 +323,11 @@ def evaluation():
             # vis
             if data_args.vis_path is not None:
                 os.makedirs(data_args.vis_path, exist_ok=True)
-                for idx, image_name in enumerate(inputs['image_name']):
-                    gt_mask = inputs['masks'][idx].squeeze(0) * 255
-                    pred_mask = outputs[idx]['pred_masks'] * 255
+                for vis_idx, image_name in enumerate(inputs['image_name']):
+                    gt_mask = inputs['masks'][vis_idx].squeeze(0) * 255
+                    pred_mask = outputs[vis_idx]['pred_masks'] * 255
+                    if pred_mask.dim() == 3:
+                        pred_mask = pred_mask[0]   # take top-scoring query for multi-mask outputs
                     gt_mask_np = gt_mask.cpu().numpy().astype(np.uint8)
                     pred_mask_np = pred_mask.cpu().numpy().astype(np.uint8)
                     gt_mask_root = os.path.join(data_args.vis_path, image_name + "_gt.png")

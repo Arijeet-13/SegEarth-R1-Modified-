@@ -103,9 +103,11 @@ def sample_reasoning_answers(
 def _build_reasoning_item(image, question, answer_text, tokenizer):
     """Mirrors ReasonSegDataset.__getitem__, but with a caller-supplied
     `answer_text` (generated) instead of the ground-truth QA answer."""
-    conversation_lib.default_conversation = conversation_lib.conv_templates.get(
-        conversation_lib.default_conversation.version, conversation_lib.default_conversation
-    )
+    # Ensure default_conversation is set to the phi template used throughout eval.
+    # Use a direct key lookup rather than round-tripping through .version, since
+    # conv_llava_phi.version == "phi" which is not a key in conv_templates.
+    if conversation_lib.default_conversation.version != "phi":
+        conversation_lib.default_conversation = conversation_lib.conv_templates["llava_phi"]
     instruction = f" {question}"
     sources = [[
         {"from": "human", "value": PREFIX_INST + "\n<refer>"},
@@ -189,7 +191,8 @@ def predict_masks_given_answers(
     # Pre-warm the vision-tower cache with the single image so the backbone
     # runs exactly once regardless of how many candidates are in the batch.
     model._cached_raw_features = None
-    _ = model.run_vision_tower(batch["images"].float().to(device))
+    with torch.no_grad():
+        _ = model.run_vision_tower(batch["images"].float())
 
     outputs = model.eval_seg(
         input_ids=batch["input_ids"],
@@ -239,7 +242,7 @@ def aggregate_average(candidates, threshold=0.5, **kwargs):
 def aggregate_majority_vote(candidates: List[dict], **kwargs) -> Tuple[torch.Tensor, dict]:
     binary = _stack(candidates)
     vote = binary.mean(0)
-    return (vote > 0.5).float(), {"agreement": float(vote.max())}
+    return (vote > 0.5).float(), {"agreement": float(vote.mean())}
 
 
 def aggregate_best_of_n(
@@ -390,7 +393,7 @@ def parallel_scale_referring(
     aggregator: str = "average",
     device="cuda",
     oracle_iou_fn: Optional[Callable[[torch.Tensor], float]] = None,
-    flip_prob: float = 0.0,
+    flip_prob: float = 0.5,   # default matches DataArguments; 0.0 gives zero diversity
     referring_text: Optional[str] = None,
     **kwargs
 ) -> dict:
@@ -399,15 +402,22 @@ def parallel_scale_referring(
 
     # Determine whether we can safely flip the image (avoid directional terms like left/right/east/west)
     directional_words = ["left", "right", "east", "west", "top", "bottom", "north", "south", "upper", "lower"]
-    should_flip = False
-    if flip_prob > 0.0:
-        should_flip = True
-        if referring_text is not None:
-            text_lower = referring_text.lower()
-            if any(word in text_lower for word in directional_words):
-                should_flip = False
+    should_flip = flip_prob > 0.0
+    if should_flip and referring_text is not None:
+        if any(w in referring_text.lower() for w in directional_words):
+            should_flip = False
 
-    # Stacking inputs into batches to perform a single forward pass
+    if not should_flip and n > 1:
+        # No augmentation possible — all passes would be identical; run just once and return.
+        import warnings
+        warnings.warn(
+            "[parallel_scale_referring] flip_prob=0 or directional text detected: "
+            "all n passes are identical. Running a single pass instead.",
+            RuntimeWarning, stacklevel=2,
+        )
+        n = 1
+
+    # Stack inputs into a batch for a single forward pass
     input_ids = inputs["input_ids"].repeat(n, 1)
     attention_mask = inputs["attention_mask"].repeat(n, 1)
     refer_embedding_indices = inputs["refer_embedding_indices"].repeat(n, 1)

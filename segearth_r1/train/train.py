@@ -95,7 +95,6 @@ class ModelArguments:
     dino_path: Optional[str] = field(default=None)
     process_depth: Optional[int] = field(default=1)
     use_seg_query: bool = field(default=False)
-    use_multiscale_seg: bool = field(default=True)  # Toggle multi-scale SEG embedding
     mask2former_checkpoint: Optional[str] = field(default=None)
 
 @dataclass
@@ -388,7 +387,6 @@ def train():
         add_cross_attn=True,
         cache_dir=training_args.cache_dir,
         use_seg_query=model_args.use_seg_query,
-        use_multiscale_seg=model_args.use_multiscale_seg,
         **bnb_model_from_pretrained_args)
     
     if not model.is_train_mask_decode:

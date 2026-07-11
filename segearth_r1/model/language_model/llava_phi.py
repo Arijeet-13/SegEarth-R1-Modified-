@@ -400,9 +400,10 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             )
         return new_targets
 
-    def get_special_token(self, SEG, EOS):
+    def get_special_token(self, SEG, EOS, SEG_M=None):
         self.SEG_id = SEG
         self.EOS_id = EOS
+        self.SEG_M_id = SEG_M  # None unless use_multi_target_seg=True
 
     def embed_refer_ids(self, refer_ids):
         if refer_ids is None:
@@ -411,7 +412,8 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         return embedded_refer
     def concat_image_seg_embeds(self, input_id, img_feature, label, seg_query, seg_query_mask,
                                     refer_embedding_indices=None, refer_embedding=None,
-                                    answer_embedding_indices=None, answer_embedding=None, token_answer_id=None):
+                                    answer_embedding_indices=None, answer_embedding=None, token_answer_id=None,
+                                    answer_target_group_ids=None):
         image_token_indices = torch.where(input_id == IMAGE_TOKEN_INDEX)[0] 
         if seg_query is not None:
             seg_query_indices = torch.where(input_id == SEG_TOKEN_INDEX)[0] 
@@ -430,6 +432,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             cur_new_label = None
         cur_refer_embedding_indices = [] if refer_embedding_indices is not None else None 
         cur_answer_embedding_indices = [] if answer_embedding_indices is not None else None
+        cur_target_group_ids = [] if answer_target_group_ids is not None else None
         chunks = [] 
         current_chunk = [] 
 
@@ -459,6 +462,10 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                     cur_answer_embedding_indices.append(
                         torch.full((img_feature.shape[0],), 0, device=input_id.device,
                                    dtype=input_id.dtype))
+                if answer_target_group_ids is not None:
+                    cur_target_group_ids.append(
+                        torch.full((img_feature.shape[0],), 0, device=input_id.device,
+                                   dtype=input_id.dtype))
                 if label is not None: 
                     cur_new_label.append(
                         torch.full((img_feature.shape[0],), IGNORE_INDEX, device=label.device,
@@ -473,6 +480,9 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                                                                        dtype=label.dtype))
                     if answer_embedding_indices is not None:
                         cur_answer_embedding_indices.append(torch.full((seg_query.shape[0],), 0, device=label.device,
+                                                                       dtype=label.dtype))
+                    if answer_target_group_ids is not None:
+                        cur_target_group_ids.append(torch.full((seg_query.shape[0],), 0, device=label.device,
                                                                        dtype=label.dtype))
                     if label is not None: 
                         cur_new_label.append(
@@ -491,6 +501,10 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                                    dtype=input_id.dtype))
                 if answer_embedding_indices is not None:
                     cur_answer_embedding_indices.append(
+                        torch.full((refer_embed.shape[0],), 0, device=input_id.device,
+                                   dtype=input_id.dtype))
+                if answer_target_group_ids is not None:
+                    cur_target_group_ids.append(
                         torch.full((refer_embed.shape[0],), 0, device=input_id.device,
                                    dtype=input_id.dtype))
                 if label is not None: 
@@ -513,6 +527,13 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                     cur_answer_embedding_indices.append(
                         torch.full((answer_embed.shape[0],), 1, device=input_id.device,
                                    dtype=input_id.dtype))
+                if answer_target_group_ids is not None:
+                    agt = answer_target_group_ids.to(device=input_id.device, dtype=input_id.dtype)
+                    if agt.shape[0] != answer_embed.shape[0]:
+                        # Safety net: length mismatch would silently misalign groups.
+                        # Fall back to "no grouping" for this sample rather than crash/misalign.
+                        agt = torch.zeros(answer_embed.shape[0], device=input_id.device, dtype=input_id.dtype)
+                    cur_target_group_ids.append(agt)
                 if label is not None:
                     cur_new_label.append(token_answer_id)
                      
@@ -524,6 +545,9 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                     cur_refer_embedding_indices.append(refer_embedding_indices[:chunk_len])
                 if answer_embedding_indices is not None:
                     cur_answer_embedding_indices.append(answer_embedding_indices[:chunk_len])
+                if answer_target_group_ids is not None:
+                    cur_target_group_ids.append(
+                        torch.zeros(chunk_len, device=input_id.device, dtype=input_id.dtype))
                 if label is not None:
                     cur_new_label.append(label[:chunk_len])
 
@@ -549,11 +573,15 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         if answer_embedding_indices is not None:
             cur_answer_embedding_indices = [x.to(device=self.device) for x in cur_answer_embedding_indices]
             cur_answer_embedding_indices = torch.cat(cur_answer_embedding_indices, dim=0)
-        return cur_new_input_embeds, cur_new_label, cur_new_seg_query_mask, cur_refer_embedding_indices, cur_answer_embedding_indices
+        if answer_target_group_ids is not None:
+            cur_target_group_ids = [x.to(device=self.device) for x in cur_target_group_ids]
+            cur_target_group_ids = torch.cat(cur_target_group_ids, dim=0)
+        return cur_new_input_embeds, cur_new_label, cur_new_seg_query_mask, cur_refer_embedding_indices, cur_answer_embedding_indices, cur_target_group_ids
     
     def prepare_inputs_labels_for_multimodal(
             self, input_ids, attention_mask, past_key_values, labels, images,
-            token_refer_id=None, token_answer_id=None, refer_embedding_indices=None, answer_embedding_indices=None, use_seg_query=False
+            token_refer_id=None, token_answer_id=None, refer_embedding_indices=None, answer_embedding_indices=None, use_seg_query=False,
+            target_group_ids=None
     ): 
         vision_tower = self.get_vision_tower()
         seg_query_mask = torch.zeros_like(input_ids) if use_seg_query else None
@@ -562,7 +590,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 1] == 1:
                 attention_mask = torch.ones((attention_mask.shape[0], past_key_values[-1][-1].shape[-2] + 1),
                                             dtype=attention_mask.dtype, device=attention_mask.device)
-            return input_ids, attention_mask, past_key_values, None, labels, seg_query_mask, None, None
+            return input_ids, attention_mask, past_key_values, None, labels, seg_query_mask, None, None, None
 
         if type(images) is list or images.ndim == 5:
             concat_images = torch.cat([image for image in images], dim=0)
@@ -580,6 +608,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         new_seg_query_masks = [] if seg_query_mask is not None else None
         new_refer_embedding_indices = [] if refer_embedding_indices is not None else None
         new_answer_embedding_indices = [] if answer_embedding_indices is not None else None
+        new_target_group_ids = [] if target_group_ids is not None else None
         for batch_idx, cur_input_ids in enumerate(input_ids):
             if use_seg_query:
                 cur_seg_query_mask = seg_query_mask[batch_idx]
@@ -587,6 +616,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             cur_image_feature = image_features[batch_idx]
             cur_refer_embedding_indices = refer_embedding_indices[batch_idx] if refer_embedding_indices is not None else None
             cur_answer_embedding_indices = answer_embedding_indices[batch_idx] if answer_embedding_indices is not None else None
+            cur_sample_target_group_ids = target_group_ids[batch_idx] if target_group_ids is not None else None
             if (cur_input_ids == IMAGE_TOKEN_INDEX).sum() == 0: 
                 # multimodal LLM, but the current sample is not multimodal
                 cur_input_embeds = self.get_model().embed_tokens(cur_input_ids)
@@ -604,6 +634,8 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                     new_refer_embedding_indices.append(cur_refer_embedding_indices)
                 if new_answer_embedding_indices is not None:
                     new_answer_embedding_indices.append(cur_answer_embedding_indices)
+                if new_target_group_ids is not None:
+                    new_target_group_ids.append(torch.zeros_like(cur_input_ids))
                 # cur_image_idx += 1
                 continue
 
@@ -625,7 +657,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             cur_refer_embedding = self.embed_refer_ids(cur_token_refer_id)
             cur_answer_embedding = self.embed_refer_ids(cur_token_answer_id)
             if use_seg_query:
-                cur_input_embeds, cur_label, cur_seg_query_mask, cur_refer_embedding_indices, cur_answer_embedding_indices = self.concat_image_seg_embeds(
+                cur_input_embeds, cur_label, cur_seg_query_mask, cur_refer_embedding_indices, cur_answer_embedding_indices, cur_out_target_group_ids = self.concat_image_seg_embeds(
                     input_id=cur_input_ids, # [seq_len, ]
                     img_feature=cur_image_feature, # [256, 2048]
                     label=cur_label, # [seq_len, ]
@@ -636,10 +668,11 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                     answer_embedding_indices=cur_answer_embedding_indices,
                     answer_embedding=cur_answer_embedding,
                     token_answer_id = cur_token_answer_id,
+                    answer_target_group_ids=cur_sample_target_group_ids,
                 )
                 assert cur_input_embeds.shape[0] == cur_seg_query_mask.shape[0]
             else:
-                cur_input_embeds, cur_label, cur_seg_query_mask, cur_refer_embedding_indices, cur_answer_embedding_indices = self.concat_image_seg_embeds(
+                cur_input_embeds, cur_label, cur_seg_query_mask, cur_refer_embedding_indices, cur_answer_embedding_indices, cur_out_target_group_ids = self.concat_image_seg_embeds(
                     input_id=cur_input_ids, # [seq_len, ]
                     img_feature=cur_image_feature, # [64, 2048]
                     label=cur_label, # [seq_len, ]
@@ -650,6 +683,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                     answer_embedding_indices=cur_answer_embedding_indices,
                     answer_embedding=cur_answer_embedding,
                     token_answer_id = cur_token_answer_id,
+                    answer_target_group_ids=cur_sample_target_group_ids,
                 )
                 
             new_input_embeds.append(cur_input_embeds) 
@@ -661,6 +695,8 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 new_refer_embedding_indices.append(cur_refer_embedding_indices)
             if answer_embedding_indices is not None:
                 new_answer_embedding_indices.append(cur_answer_embedding_indices)
+            if new_target_group_ids is not None:
+                new_target_group_ids.append(cur_out_target_group_ids)
         if any(x.shape != new_input_embeds[0].shape for x in new_input_embeds): 
             max_len = max(x.shape[0] for x in new_input_embeds)
 
@@ -713,6 +749,16 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                     new_answer_embedding_indices_align.append(new_answer_embedding_indice)
                 new_answer_embedding_indices = torch.stack(new_answer_embedding_indices_align, dim=0) 
 
+            if new_target_group_ids is not None:
+                new_target_group_ids_align = []
+                for cur_tgi in new_target_group_ids:
+                    cur_tgi = torch.cat(
+                        (cur_tgi,
+                         torch.zeros((max_len - cur_tgi.shape[0]), dtype=cur_tgi.dtype, device=cur_tgi.device)),
+                        dim=0)
+                    new_target_group_ids_align.append(cur_tgi)
+                new_target_group_ids = torch.stack(new_target_group_ids_align, dim=0)
+
             if attention_mask is not None: 
                 new_attention_mask = []
                 for cur_attention_mask, cur_new_labels, cur_new_labels_align in zip(attention_mask, _new_labels,
@@ -737,6 +783,8 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 new_refer_embedding_indices = torch.stack(new_refer_embedding_indices, dim=0)
             if answer_embedding_indices is not None:
                 new_answer_embedding_indices = torch.stack(new_answer_embedding_indices, dim=0)
+            if new_target_group_ids is not None:
+                new_target_group_ids = torch.stack(new_target_group_ids, dim=0)
 
             if attention_mask is not None:
                 new_attn_mask_pad_left = torch.full(
@@ -744,7 +792,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                     dtype=attention_mask.dtype, device=attention_mask.device)
                 attention_mask = torch.cat((new_attn_mask_pad_left, attention_mask), dim=1)
                 assert attention_mask.shape == new_input_embeds.shape[:2]
-        return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_seg_query_masks, new_refer_embedding_indices, new_answer_embedding_indices
+        return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_seg_query_masks, new_refer_embedding_indices, new_answer_embedding_indices, new_target_group_ids
     
     def get_SEG_embedding(self, hidden_states, refer_embedding_indices, return_all=False, target_group_ids=None):
         """
@@ -819,7 +867,6 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             return refer_embedding_list  # List of [num_targets, hidden_dim] tensors
         else:
             return torch.stack(refer_embedding_list, dim=0) if not return_all else refer_embedding_list
-        return torch.stack(refer_embedding_list, dim=0) if not return_all else refer_embedding_list
     
     def PyramidPoolAgg(self, image_features):
         B, C, H, W = image_features["res5"].shape
@@ -859,9 +906,10 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if batch_dataset_type != "mm_conv":
-            input_ids, attention_mask, past_key_values, inputs_embeds, labels, seg_query_mask, refer_embedding_indices, answer_embedding_indices = self.prepare_inputs_labels_for_multimodal(
+            input_ids, attention_mask, past_key_values, inputs_embeds, labels, seg_query_mask, refer_embedding_indices, answer_embedding_indices, target_group_ids = self.prepare_inputs_labels_for_multimodal(
                 input_ids, attention_mask, past_key_values, labels, images,
-                token_refer_id, token_answer_id, refer_embedding_indices, answer_embedding_indices, self.use_seg_query)
+                token_refer_id, token_answer_id, refer_embedding_indices, answer_embedding_indices, self.use_seg_query,
+                target_group_ids)
         else:
             seg_query_mask = None
             input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.mm_conv_prepare_inputs_labels_for_multimodal(
@@ -899,6 +947,8 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             else:
                 seg_query = None
             image_features = self.get_vision_tower_feature(images)
+            pixel_dec_dtype = next(self.pixel_decoder.parameters()).dtype if list(self.pixel_decoder.parameters()) else torch.float32
+            image_features = {k: v.to(dtype=pixel_dec_dtype) for k, v in image_features.items()}
             mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
                 image_features)
             if refer_embedding_indices is not None:
@@ -915,7 +965,9 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                     seg_indices = refer_embedding_indices
                     
                 SEG_embedding = self.get_SEG_embedding(hidden_states, seg_indices, return_all=True, target_group_ids=target_group_ids)
-                
+                local_vision = image_features["res5"].flatten(2).permute(0, 2, 1)
+                local_vision = self.local_project(local_vision)
+
                 # Handle multi-target vs single-target outputs
                 if self.use_multi_target_seg and target_group_ids is not None:
                     # Multi-target mode: SEG_embedding is list of [num_targets, hidden_dim] per sample
@@ -938,8 +990,6 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 else:
                     # Single-target mode (original behavior)
                     origin_SEG_embedding = torch.cat([self.origin_SEG_token_projector(kk.unsqueeze(0)[:, 0:1]) for kk in SEG_embedding])
-                    local_vision = image_features["res5"].flatten(2).permute(0, 2, 1)
-                    local_vision = self.local_project(local_vision)   
                     new_SEG_embedding = []
                     for batch_idx, cur_SEG_embedding in enumerate(SEG_embedding):
                         cur_SEG_embedding = self.text_projector(cur_SEG_embedding.unsqueeze(0))
@@ -953,7 +1003,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 SEG_embedding = None
 
             # Call predictor - handles both single and multi-target
-            if self.use_multi_target_seg and isinstance(SEG_embedding, list):
+            if self.use_multi_target_seg and target_group_ids is not None and isinstance(SEG_embedding, list):
                 # Multi-target: process each sample's targets separately
                 mask_outputs_list = []
                 for batch_idx, batch_seg_emb in enumerate(SEG_embedding):
@@ -999,7 +1049,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                         targets.append(target)
                 
                 # Compute losses
-                if self.use_multi_target_seg and isinstance(mask_outputs, list):
+                if self.use_multi_target_seg and target_group_ids is not None and isinstance(mask_outputs, list):
                     # Multi-target: aggregate losses across samples
                     total_mask_losses = {}
                     for sample_output, sample_targets in zip(mask_outputs, targets):
@@ -1250,9 +1300,10 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels, seg_query_mask, refer_embedding_indices, answer_embedding_indices = self.prepare_inputs_labels_for_multimodal(
+        input_ids, attention_mask, past_key_values, inputs_embeds, labels, seg_query_mask, refer_embedding_indices, answer_embedding_indices, target_group_ids = self.prepare_inputs_labels_for_multimodal(
             input_ids, attention_mask, past_key_values, labels, images,
-            token_refer_id, token_answer_id, refer_embedding_indices, answer_embedding_indices, self.use_seg_query)
+            token_refer_id, token_answer_id, refer_embedding_indices, answer_embedding_indices, self.use_seg_query,
+            target_group_ids)
 
         outputs = self.model(
             input_ids=input_ids,
@@ -1271,8 +1322,6 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         else:
             seg_query = None
         image_features = self.get_vision_tower_feature(images)
-        pixel_dec_dtype = next(self.pixel_decoder.parameters()).dtype if list(self.pixel_decoder.parameters()) else torch.float32
-        image_features = {k: v.to(dtype=pixel_dec_dtype) for k, v in image_features.items()}
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
 
@@ -1283,7 +1332,9 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             # Note: eval doesn't have batch_dataset_type, so we check answer_embedding_indices availability
             seg_indices = answer_embedding_indices if answer_embedding_indices is not None else refer_embedding_indices
             SEG_embedding = self.get_SEG_embedding(hidden_states, seg_indices, return_all=True, target_group_ids=target_group_ids)
-            
+            local_vision = image_features["res5"].flatten(2).permute(0, 2, 1)
+            local_vision = self.local_project(local_vision)
+
             # Handle multi-target vs single-target outputs
             if self.use_multi_target_seg and target_group_ids is not None:
                 # Multi-target mode: SEG_embedding is list of [num_targets, hidden_dim] per sample
@@ -1304,8 +1355,6 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             else:
                 # Single-target (original)
                 origin_SEG_embedding = torch.cat([self.origin_SEG_token_projector(kk.unsqueeze(0)[:, 0:1]) for kk in SEG_embedding])
-                local_vision = image_features["res5"].flatten(2).permute(0, 2, 1)
-                local_vision = self.local_project(local_vision)
                 new_SEG_embedding = []
                 for batch_idx, cur_SEG_embedding in enumerate(SEG_embedding):
                     cur_SEG_embedding = self.text_projector(cur_SEG_embedding.unsqueeze(0))
@@ -1319,7 +1368,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             SEG_embedding = None
 
         # Call predictor - handles both single and multi-target
-        if self.use_multi_target_seg and isinstance(SEG_embedding, list):
+        if self.use_multi_target_seg and  target_group_ids is not None and isinstance(SEG_embedding, list):
             # Multi-target: process per sample
             mask_outputs_list = []
             for batch_idx, batch_seg_emb in enumerate(SEG_embedding):
@@ -1371,7 +1420,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         
         processed_results = []
         # Handle multi-target list format vs single-target tensor
-        if self.use_multi_target_seg and isinstance(mask_pred_results, list):
+        if self.use_multi_target_seg and  target_group_ids is not None and isinstance(mask_pred_results, list):
             # Multi-target: each element is one sample's predictions
             for sample_cls, sample_mask in zip(SEG_cls_results, mask_pred_results):
                 if sample_cls is not None:

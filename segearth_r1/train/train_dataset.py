@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 
 from segearth_r1.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, \
     DEFAULT_IM_END_TOKEN, DEFAULT_SEG_TOKEN, SEG_TOKEN_INDEX, \
-    REFER_TOKEN_INDEX,ANSWER_TOKEN_INDEX
+    REFER_TOKEN_INDEX,ANSWER_TOKEN_INDEX, DEFAULT_SEG_M_TOKEN
 from torch.utils.data import Dataset
 from segearth_r1 import conversation as conversation_lib
 from segearth_r1.model import *
@@ -509,6 +509,164 @@ class MM_Conv_Dataset(Dataset):
             data_dict['image'] = torch.zeros(3, self.image_size, self.image_size)
         return data_dict  
 
+
+
+def preprocess_multi_target_answer(target_texts, tokenizer, seg_token_num, seg_m_token=DEFAULT_SEG_M_TOKEN):
+    """
+    Build one answer token sequence covering multiple targets, each followed by
+    `seg_token_num` consecutive [SEG_M] tokens, plus a parallel `target_group_ids`
+    tensor (0 = ordinary text, k = the k-th [SEG_M] group, 1-indexed) so the model
+    can later gather/fuse each target's tokens separately. Fully separate from
+    preprocess_referring_instruction (which drives the existing binary/[SEG] path).
+    """
+    seg_m_id = tokenizer.encode(seg_m_token, add_special_tokens=False)[0]
+    all_ids, all_group_ids = [], []
+    for target_idx, text in enumerate(target_texts, start=1):
+        word_ids = tokenizer.encode(text, add_special_tokens=False)
+        all_ids.extend(word_ids)
+        all_group_ids.extend([0] * len(word_ids))
+        all_ids.extend([seg_m_id] * seg_token_num)
+        all_group_ids.extend([target_idx] * seg_token_num)
+    token_answer_id = torch.tensor(all_ids, dtype=torch.long)
+    target_group_ids = torch.tensor(all_group_ids, dtype=torch.long)
+    return token_answer_id, target_group_ids
+
+
+class MultiTargetReasonSegDataset(Dataset):
+    """
+    PixelLM-style multi-target wrapper around ReasonSegDataset. Does NOT modify
+    ReasonSegDataset or its data files - composes over it read-only, so the
+    binary/single-target training path is completely unaffected whether or not
+    this class is ever used.
+
+    NOTE on data assumption: RSReasonSeg ships one binary mask per image (verified:
+    images/labels/QAs are 1:1). There is no native multi-instance annotation to
+    draw on, so multiple targets per training example are synthesized by running
+    connected-component analysis on that single binary mask. If your data
+    actually has real multi-instance annotations, swap `_build_targets` below to
+    read them instead - everything downstream (token building, collator, model)
+    is agnostic to where the per-instance masks come from.
+    """
+    def __init__(self, base_data_path, tokenizer, image_size=1024, seg_token_num=1,
+                 max_targets_per_sample=3, min_component_area=100):
+        super().__init__()
+        self.base = ReasonSegDataset(base_data_path, tokenizer, image_size)
+        self.tokenizer = tokenizer
+        self.image_size = image_size
+        self.seg_token_num = max(1, seg_token_num)
+        self.max_targets_per_sample = max_targets_per_sample
+        self.min_component_area = min_component_area
+
+    def __len__(self):
+        return len(self.base)
+
+    def _build_targets(self, raw_mask):
+        """Split one binary mask into up to N per-instance masks via connected components."""
+        raw_mask = (raw_mask != 0).astype(np.uint8)
+        num_labels, components = cv2.connectedComponents(raw_mask, connectivity=8)
+        instance_masks = []
+        for label in range(1, num_labels):  # 0 = background
+            inst = (components == label).astype(np.uint8)
+            if inst.sum() >= self.min_component_area:
+                instance_masks.append(inst)
+        if len(instance_masks) == 0:
+            # No component survived the area filter (or mask was empty) - fall back
+            # to the original single mask so this sample is still usable.
+            instance_masks = [raw_mask]
+        # Largest components first, capped at max_targets_per_sample
+        instance_masks.sort(key=lambda m: m.sum(), reverse=True)
+        return instance_masks[:self.max_targets_per_sample]
+
+    def __getitem__(self, idx):
+        data_dict = {}
+        image_path = self.base.images[idx]
+        image = cv2.imread(image_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        processed_image = preprocess_image(image, self.image_size)
+        processed_image = (torch.tensor(processed_image) - self.base.pixel_mean) / self.base.pixel_std
+        data_dict['image'] = processed_image
+
+        label_path = self.base.labels[idx]
+        raw_mask = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
+        instance_masks = self._build_targets(raw_mask)
+        num_targets = len(instance_masks)
+        data_dict['masks'] = [preprocess_mask(m, self.image_size) for m in instance_masks]
+
+        QAs = self.base.QAs[idx]
+        question = QAs["questions"][0]
+        answer_num = len(QAs["answer"])
+        base_answer = QAs["answer"][0] if answer_num > 0 else "There is no target object in the image."
+
+        prefix_inst = 'This is an image <image>, Please doing Reasoning Segmentation according to the following instruction:'
+        instruction = ' {}'.format(question)
+        sources = [[{'from': 'human', 'value': prefix_inst + '\n<refer>'},
+                    {'from': 'gpt', 'value': 'Sure, It is <seg>. \n<answer>.'}]]
+        text_dict = preprocess_llama2(sources, self.tokenizer)
+        input_ids = text_dict['input_ids'][0]
+        labels = text_dict['labels'][0]
+        data_dict['input_ids'] = input_ids
+        data_dict['labels'] = labels
+        data_dict['dataset_type'] = 'reason_seg'  # reuse existing branch, no forward() changes needed
+
+        token_refer_id = preprocess_referring_instruction(instruction, self.tokenizer)
+        # One text segment per synthesized target, each capped by seg_token_num [SEG_M] tokens
+        target_texts = [f"{base_answer}, instance {i + 1}" for i in range(num_targets)]
+        token_answer_id, target_group_ids = preprocess_multi_target_answer(
+            target_texts, self.tokenizer, self.seg_token_num)
+
+        refer_embedding_indices = torch.zeros_like(input_ids)
+        refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
+        answer_embedding_indices = torch.zeros_like(input_ids)
+        answer_embedding_indices[input_ids == ANSWER_TOKEN_INDEX] = 1
+
+        data_dict['token_refer_id'] = token_refer_id
+        data_dict['token_answer_id'] = token_answer_id
+        data_dict['target_group_ids'] = target_group_ids  # same length as token_answer_id
+        data_dict['refer_embedding_indices'] = refer_embedding_indices
+        data_dict['answer_embedding_indices'] = answer_embedding_indices
+        return data_dict
+
+
+class MultiTargetDataCollector(object):
+    """
+    Separate collator for MultiTargetReasonSegDataset - does not touch/replace
+    DataCollector, so the binary-segmentation dataloader is unaffected.
+    """
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, data_dicts):
+        input_ids = [d['input_ids'] for d in data_dicts]
+        labels = [d['labels'] for d in data_dicts]
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        input_ids = input_ids[:, :self.tokenizer.model_max_length]
+        labels = labels[:, :self.tokenizer.model_max_length]
+
+        batch = dict(
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+        )
+        batch['images'] = torch.stack([d['image'] for d in data_dicts])
+        # List of lists: masks[i] is a list of per-target masks for sample i.
+        # forward() already branches on isinstance(masks[0], (list, tuple)).
+        batch['masks'] = [d['masks'] for d in data_dicts]
+        batch['dataset_type'] = [d['dataset_type'] for d in data_dicts]
+        batch['token_refer_id'] = [d['token_refer_id'] for d in data_dicts]
+        # Kept as plain lists (not padded) so token_answer_id[i] and
+        # target_group_ids[i] stay length-aligned per sample.
+        batch['token_answer_id'] = [d['token_answer_id'] for d in data_dicts]
+        batch['target_group_ids'] = [d['target_group_ids'] for d in data_dicts]
+
+        refer_embedding_indices = torch.nn.utils.rnn.pad_sequence(
+            [d['refer_embedding_indices'] for d in data_dicts], batch_first=True, padding_value=0)
+        batch['refer_embedding_indices'] = refer_embedding_indices
+        answer_embedding_indices = torch.nn.utils.rnn.pad_sequence(
+            [d['answer_embedding_indices'] for d in data_dicts], batch_first=True, padding_value=0)
+        batch['answer_embedding_indices'] = answer_embedding_indices
+        return batch
 
 
 class DataCollector(object):

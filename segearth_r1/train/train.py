@@ -97,6 +97,11 @@ class ModelArguments:
     use_seg_query: bool = field(default=False)
     use_multiscale_seg: bool = field(default=False)  # Deprecated - kept for compatibility
     mask2former_checkpoint: Optional[str] = field(default=None)
+    use_multi_target_seg: bool = field(default=False, metadata={
+        "help": "Enable PixelLM-style multi-target [SEG_M] fusion. Off by default; "
+                "does not affect the binary/single-target [SEG] path or vocab size."})
+    seg_token_num: int = field(default=1, metadata={
+        "help": "Number of consecutive [SEG_M] tokens per target when use_multi_target_seg=True."})
 
 @dataclass
 class DataArguments:
@@ -388,6 +393,8 @@ def train():
         add_cross_attn=True,
         cache_dir=training_args.cache_dir,
         use_seg_query=model_args.use_seg_query,
+        use_multi_target_seg=model_args.use_multi_target_seg,
+        seg_token_num=model_args.seg_token_num,
         **bnb_model_from_pretrained_args)
     
     if not model.is_train_mask_decode:
@@ -472,8 +479,15 @@ def train():
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer) 
 
     tokenizer.add_tokens("[SEG]") 
+    if model_args.use_multi_target_seg:
+        # Separate token from "[SEG]" so binary-segmentation embeddings/gradients
+        # are never touched by multi-target training.
+        tokenizer.add_tokens(DEFAULT_SEG_M_TOKEN)
     model.resize_token_embeddings(len(tokenizer))
-    model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
+    seg_m_kwargs = {}
+    if model_args.use_multi_target_seg:
+        seg_m_kwargs['SEG_M'] = tokenizer(DEFAULT_SEG_M_TOKEN, return_tensors='pt', add_special_tokens=False)['input_ids']
+    model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id, **seg_m_kwargs)
 
     data_module = make_unify_datamodule(tokenizer=tokenizer, data_args=data_args, training_args=training_args) 
     training_args.dataloader_drop_last = True

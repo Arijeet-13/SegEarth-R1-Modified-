@@ -118,7 +118,8 @@ def _build_reasoning_item(image, question, answer_text, tokenizer):
     labels = text_dict["labels"][0]
 
     token_refer_id = preprocess_referring_instruction(instruction, tokenizer)
-    token_answer_id = preprocess_referring_instruction(answer_text, tokenizer)
+    # Don't append [SEG] to answer — it's just the text tokens
+    token_answer_id = torch.tensor(tokenizer.encode(answer_text, add_special_tokens=False))
     refer_embedding_indices = torch.zeros_like(input_ids)
     refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
     answer_embedding_indices = torch.zeros_like(input_ids)
@@ -140,27 +141,24 @@ def _build_reasoning_item(image, question, answer_text, tokenizer):
 def _mask_confidence(result: dict) -> float:
     """Extracts the free confidence signal SegEarth-R1 already computes in
     `SEG_instance_inference` (SEG-classifier score x mean foreground mask
-    probability). Falls back to mean foreground probability if the
+    probability). Falls back to mean sigmoid probability if the
     classifier head isn't active (e.g. seg_task == 'referring')."""
     scores = result.get("scores")
     if scores is not None and len(scores) > 0:
         # Use the maximum score across all candidate queries, not an arbitrary index
         return float(scores.max())
 
-    # Fall back to mean sigmoid probability over foreground pixels in raw logits
+    # Fall back to mean sigmoid probability over raw logits (not binarized masks)
     raw = result.get("raw_masks")
-    if raw is not None:
-        pred = raw[0] if raw.dim() == 3 else raw
-        fg = pred > 0
-        if fg.sum() == 0:
-            return 0.0
-        return float(pred.sigmoid()[fg].mean())
-
-    raw = result.get("raw_masks")  # logits before sigmoid
     if raw is None:
+        print("[_mask_confidence] WARNING: No raw_masks available, returning 0.0")
         return 0.0  # no confidence signal available
     pred = raw[0] if raw.dim() == 3 else raw
-    return float(pred.sigmoid().mean())  # proper confidence from logits
+    conf = float(pred.sigmoid().mean())
+    # Debug: print actual logit statistics
+    print(f"[_mask_confidence DEBUG] raw logit range: [{pred.min():.3f}, {pred.max():.3f}], mean: {pred.mean():.3f}, confidence: {conf:.6f}")
+    return conf  # proper confidence from logits
+
 
 
 @torch.no_grad()

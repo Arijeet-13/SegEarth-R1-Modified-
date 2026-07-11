@@ -819,18 +819,8 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
 
-        # Early return for generation mode (no dataset_type → no segmentation)
-        if batch_dataset_type not in ['mm_conv', 'reason_seg', 'refer_seg']:
-            return CausalLMOutputWithPast(
-                loss=None,
-                logits=logits,
-                past_key_values=outputs.past_key_values,
-                hidden_states=outputs.hidden_states,
-                attentions=outputs.attentions,
-            )
-
         loss = None
-        if batch_dataset_type in ['mm_conv', 'reason_seg', 'refer_seg']: 
+        if batch_dataset_type == 'mm_conv' or batch_dataset_type == 'reason_seg': 
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
@@ -840,10 +830,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             shift_labels = shift_labels.view(-1)
             # Enable model/pipeline parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            if (shift_labels != -100).any():
-                llm_loss = loss_fct(shift_logits, shift_labels)
-            else:
-                llm_loss = torch.tensor(0.0, device=shift_logits.device)
+            llm_loss = loss_fct(shift_logits, shift_labels)
 
         if batch_dataset_type == 'refer_seg' or batch_dataset_type == 'reason_seg':
             if self.use_seg_query:
@@ -851,13 +838,10 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             else:
                 seg_query = None
             image_features = self.get_vision_tower_feature(images)
-            pixel_dec_dtype = next(self.pixel_decoder.parameters()).dtype if list(self.pixel_decoder.parameters()) else torch.float32
-            image_features = {k: v.to(dtype=pixel_dec_dtype) for k, v in image_features.items()}
             mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
                 image_features)
-            seg_indices = answer_embedding_indices if answer_embedding_indices is not None else refer_embedding_indices
-            if seg_indices is not None:
-                SEG_embedding = self.get_SEG_embedding(hidden_states, seg_indices, return_all = True)
+            if refer_embedding_indices is not None:
+                SEG_embedding = self.get_SEG_embedding(hidden_states, refer_embedding_indices, return_all = True)
                 origin_SEG_embedding = torch.cat([self.origin_SEG_token_projector(kk.unsqueeze(0)[:, 0:1]) for kk in SEG_embedding])
                 
                 if self.use_multiscale_seg:
@@ -887,15 +871,6 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 SEG_embedding = self.SEG_token_projector(SEG_embedding) 
             else:
                 SEG_embedding = None
-                
-            # Cast inputs of the predictor to match the predictor's parameter precision
-            predictor_dtype = next(self.predictor.parameters()).dtype if list(self.predictor.parameters()) else torch.float32
-            multi_scale_features = [f.to(dtype=predictor_dtype) for f in multi_scale_features]
-            mask_features = mask_features.to(dtype=predictor_dtype)
-            if seg_query is not None:
-                seg_query = seg_query.to(dtype=predictor_dtype)
-            if SEG_embedding is not None:
-                SEG_embedding = SEG_embedding.to(dtype=predictor_dtype)
 
             mask_outputs = self.predictor(
                     multi_scale_features, 
@@ -1169,9 +1144,8 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
 
-        seg_indices = answer_embedding_indices if answer_embedding_indices is not None else refer_embedding_indices
-        if seg_indices is not None:  
-            SEG_embedding = self.get_SEG_embedding(hidden_states, seg_indices, return_all = True)
+        if refer_embedding_indices is not None:  
+            SEG_embedding = self.get_SEG_embedding(hidden_states, refer_embedding_indices, return_all = True)
             origin_SEG_embedding = torch.cat([self.origin_SEG_token_projector(kk.unsqueeze(0)[:, 0:1]) for kk in SEG_embedding])
             
             if self.use_multiscale_seg:
@@ -1216,15 +1190,6 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             SEG_embedding = self.SEG_token_projector(SEG_embedding)  
         else:
             SEG_embedding = None
-            
-        # Cast inputs of the predictor to match the predictor's parameter precision
-        predictor_dtype = next(self.predictor.parameters()).dtype if list(self.predictor.parameters()) else torch.float32
-        multi_scale_features = [f.to(dtype=predictor_dtype) for f in multi_scale_features]
-        mask_features = mask_features.to(dtype=predictor_dtype)
-        if seg_query is not None:
-            seg_query = seg_query.to(dtype=predictor_dtype)
-        if SEG_embedding is not None:
-            SEG_embedding = SEG_embedding.to(dtype=predictor_dtype)
 
         mask_outputs = self.predictor(
                 multi_scale_features, 

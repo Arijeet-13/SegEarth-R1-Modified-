@@ -120,11 +120,13 @@ class segearth_r1Model(LlavaMetaModel, PhiModel):
 class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaConfig
 
-    def __init__(self, config, mask_decoder_cfg=None, add_cross_attn=True, cross_attn_index=None, use_seg_query=False):
+    def __init__(self, config, mask_decoder_cfg=None, add_cross_attn=True, cross_attn_index=None, use_seg_query=False, use_multi_target_seg=False, seg_token_num=1):
         super(segearth_r1, self).__init__(config)
 
         self.model = segearth_r1Model(config, mask_decoder_cfg)
         self.use_seg_query = use_seg_query
+        self.use_multi_target_seg = use_multi_target_seg  # Toggle for multi-target segmentation
+        self.seg_token_num = seg_token_num  # Number of [SEG] tokens per target
         self.init_config = config
         self.mask_decoder_cfg = mask_decoder_cfg
         self.cross_attn_index = cross_attn_index
@@ -142,7 +144,15 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         self.origin_SEG_token_projector = nn.Linear(self.config.hidden_size, additional_dim)
         self.local_project = nn.Linear(local_fea_dim[-1], additional_dim)
         self.SEG_token_projector = nn.Linear(2 * additional_dim, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
-        self.d_layers = D_Projector(dim=additional_dim, depth=1, dim_head=64, heads=8, ff_mult=1)       
+        self.d_layers = D_Projector(dim=additional_dim, depth=1, dim_head=64, heads=8, ff_mult=1)
+        
+        # Multi-target segmentation: learnable token fusion weights (PixelLM-style codebook)
+        if self.use_multi_target_seg and seg_token_num > 1:
+            self.multiseg_scalar = nn.ParameterList([
+                nn.Parameter(torch.ones([]) * 1.0) for _ in range(seg_token_num)
+            ])
+        else:
+            self.multiseg_scalar = None
         
         if is_train_mask_decode:
             print('Mask Decoder has been trained, init directly')
@@ -736,28 +746,79 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
                 assert attention_mask.shape == new_input_embeds.shape[:2]
         return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_seg_query_masks, new_refer_embedding_indices, new_answer_embedding_indices
     
-    def get_SEG_embedding(self,hidden_states, refer_embedding_indices, return_all=False):
+    def get_SEG_embedding(self, hidden_states, refer_embedding_indices, return_all=False, target_group_ids=None):
+        """
+        Extract SEG token embeddings with optional multi-target fusion.
+        
+        Args:
+            hidden_states: [batch, seq_len, hidden_dim]
+            refer_embedding_indices: [batch, seq_len] - 0/1 mask for SEG tokens
+            return_all: whether to return all SEG tokens or just pooled
+            target_group_ids: [batch, seq_len] - target group IDs (0=not SEG, 1=target1, 2=target2, ...)
+                             Only used when use_multi_target_seg=True
+        
+        Returns:
+            If use_multi_target_seg=False: same as before (pooled embedding per sample)
+            If use_multi_target_seg=True: list of [num_targets, hidden_dim] per sample
+        """
         refer_embedding_list = []
-        for current_hidden_state, current_token_indice in zip(hidden_states, refer_embedding_indices):
+        
+        for batch_idx, (current_hidden_state, current_token_indice) in enumerate(zip(hidden_states, refer_embedding_indices)):
             # Guard against empty selection (SEG token truncated/missing)
             if current_token_indice.sum() == 0:
                 # Return zero embedding to avoid NaN from pooling empty tensor
                 empty_embedding = torch.zeros(1, current_hidden_state.shape[-1], 
                                              device=current_hidden_state.device, 
                                              dtype=current_hidden_state.dtype)
-                if return_all:
-                    refer_embedding_list.append(empty_embedding)
-                else:
-                    refer_embedding_list.append(empty_embedding)
+                refer_embedding_list.append(empty_embedding)
                 continue
-                
+            
             current_refer_state = current_hidden_state[current_token_indice.bool()]
-            current_pool_refer_state = self.refer_pooling(current_refer_state.transpose(-2, -1)).transpose(-2, -1)
-            if return_all:
-                current_pool_refer_state = torch.cat([current_pool_refer_state, current_refer_state], dim=0)
-
-            refer_embedding_list.append(current_pool_refer_state)
+            
+            # Multi-target mode: group tokens by target and fuse with learned weights
+            if self.use_multi_target_seg and self.multiseg_scalar is not None and target_group_ids is not None:
+                current_group_ids = target_group_ids[batch_idx][current_token_indice.bool()]
+                unique_targets = torch.unique(current_group_ids[current_group_ids > 0])  # Skip 0 (non-target)
+                
+                if len(unique_targets) == 0:
+                    # Fallback: no valid targets
+                    refer_embedding_list.append(torch.zeros(1, current_hidden_state.shape[-1],
+                                                           device=current_hidden_state.device,
+                                                           dtype=current_hidden_state.dtype))
+                    continue
+                
+                target_embeddings = []
+                for target_id in unique_targets:
+                    # Get all tokens for this target
+                    target_mask = (current_group_ids == target_id)
+                    target_tokens = current_refer_state[target_mask]  # [seg_token_num, hidden_dim]
+                    
+                    if target_tokens.shape[0] != self.seg_token_num:
+                        # Fallback: incorrect token count, use simple pooling
+                        target_emb = target_tokens.mean(0, keepdim=True)
+                    else:
+                        # PixelLM-style learned weighted fusion
+                        target_emb = sum(
+                            self.multiseg_scalar[i] * target_tokens[i:i+1]
+                            for i in range(self.seg_token_num)
+                        )
+                    target_embeddings.append(target_emb)
+                
+                # Stack all target embeddings for this sample
+                refer_embedding_list.append(torch.cat(target_embeddings, dim=0))  # [num_targets, hidden_dim]
+            
+            else:
+                # Original single-target mode
+                current_pool_refer_state = self.refer_pooling(current_refer_state.transpose(-2, -1)).transpose(-2, -1)
+                if return_all:
+                    current_pool_refer_state = torch.cat([current_pool_refer_state, current_refer_state], dim=0)
+                refer_embedding_list.append(current_pool_refer_state)
         
+        # Return format depends on mode
+        if self.use_multi_target_seg and target_group_ids is not None:
+            return refer_embedding_list  # List of [num_targets, hidden_dim] tensors
+        else:
+            return torch.stack(refer_embedding_list, dim=0) if not return_all else refer_embedding_list
         return torch.stack(refer_embedding_list, dim=0) if not return_all else refer_embedding_list
     
     def PyramidPoolAgg(self, image_features):

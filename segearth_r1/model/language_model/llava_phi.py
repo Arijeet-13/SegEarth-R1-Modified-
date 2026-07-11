@@ -82,7 +82,9 @@ class segearth_r1Model(LlavaMetaModel, PhiModel):
         swin_type = getattr(model_args,'swin_type','base') 
         self.config.swin_type = swin_type
         if encoder_type == 'hiera':
-            vision_tower = build_hiera_b(vision_tower)
+            # For Hiera, use vision_tower path only if it's a valid .pth/.pt file, else None
+            hiera_weights = vision_tower if vision_tower and (vision_tower.endswith('.pth') or vision_tower.endswith('.pt')) else None
+            vision_tower = build_hiera_b(hiera_weights)
         elif swin_type == 'base':
             vision_tower = build_swin_b(vision_tower)
         if fsdp is not None and len(fsdp) > 0:

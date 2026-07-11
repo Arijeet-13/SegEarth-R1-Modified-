@@ -364,9 +364,8 @@ def sequential_scale_reasoning(
             best_mask = c["mask"]
 
         # Record the conversation turns into history for the next iteration round
+        # Don't include critique in history - it's added fresh each round by sample_reasoning_answers
         user_msg = f"{PREFIX_INST} {question}" if r == 0 else question
-        if critique:
-            user_msg += f"\n{critique}"
         history.append((conv.roles[0], user_msg))
         history.append((conv.roles[1], ans_text))
 

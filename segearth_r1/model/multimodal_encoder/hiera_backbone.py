@@ -184,6 +184,7 @@ class MultiScaleAttention(nn.Module):
             q = q.reshape(B, H * W, self.num_heads, -1)
 
         # Torch's SDPA expects [B, nheads, H*W, C] so we transpose
+        # V100 doesn't support flash attention, will use math backend
         x = F.scaled_dot_product_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),

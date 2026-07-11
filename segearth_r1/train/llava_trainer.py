@@ -371,7 +371,8 @@ class LLaVATrainer(Trainer):
                 images_batched = images_batched.to(dtype=next(self.model.get_model().get_vision_tower().parameters()).dtype)
                 torch.cuda.empty_cache()
                 try:
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                    with torch.autocast(device_type="cuda", dtype=autocast_dtype):
                         outputs = self.model.generate(
                             input_ids=prompt_ids_batched,
                             attention_mask=attention_mask_batched,
@@ -418,7 +419,8 @@ class LLaVATrainer(Trainer):
 
                 self.model._cached_raw_features = None
                 _ = self.model.run_vision_tower(batch["images"].to(dtype=next(self.model.get_model().get_vision_tower().parameters()).dtype))
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                with torch.autocast(device_type="cuda", dtype=autocast_dtype):
                     outputs_seg = self.model.eval_seg(
                         input_ids=batch["input_ids"],
                         attention_mask=batch["attention_mask"],
@@ -463,7 +465,7 @@ class LLaVATrainer(Trainer):
                 # Debug rewards logging
                 rewards_tensor = torch.tensor(group_rewards, dtype=torch.float, device=device)
                 mean_r = rewards_tensor.mean()
-                std_r = rewards_tensor.std() if rewards_tensor.numel() > 1 else torch.tensor(0.0, device=device)
+                std_r = rewards_tensor.std() if rewards_tensor.numel() > 1 else torch.tensor(1.0, device=device)
                 print(f"[GRPO debug] batch_idx={b_idx} answers={answer_texts} rewards={['%.6f' % r for r in group_rewards]}  mean={mean_r.item():.6f}  std={std_r.item():.6f}", flush=True)
 
                 if std_r < 1e-4:
@@ -558,7 +560,7 @@ class LLaVATrainer(Trainer):
             policy_loss = (-torch.min(surr1, surr2) * gen_attention_mask).sum(dim=-1) / denom  # [G]
 
             # Stable k3 KL Divergence Penalty
-            log_ratio = torch.clamp(ref_token_log_probs - new_logp, -10.0, 10.0)
+            log_ratio = torch.clamp(new_logp - ref_token_log_probs, -10.0, 10.0)
             kl = torch.exp(log_ratio) - 1 - log_ratio
             kl_loss = (self.args.kl_coeff * kl * gen_attention_mask).sum(dim=-1) / denom  # [G]
 

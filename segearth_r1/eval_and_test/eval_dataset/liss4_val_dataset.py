@@ -89,7 +89,7 @@ class Liss4ReasonSegDataset(Dataset):
         data_dict['dataset_type'] = 'reason_seg'
         
         token_refer_id = preprocess_referring_instruction(instruction, self.tokenizer)
-        token_answer_id = torch.tensor(self.tokenizer.encode(answer, add_special_tokens=False))
+        token_answer_id = preprocess_referring_instruction(answer, self.tokenizer)
         refer_embedding_indices = torch.zeros_like(input_ids)
         refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
         answer_embedding_indices = torch.zeros_like(input_ids)

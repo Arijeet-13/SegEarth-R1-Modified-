@@ -118,8 +118,8 @@ def _build_reasoning_item(image, question, answer_text, tokenizer):
     labels = text_dict["labels"][0]
 
     token_refer_id = preprocess_referring_instruction(instruction, tokenizer)
-    # Don't append [SEG] to answer — it's just the text tokens
-    token_answer_id = torch.tensor(tokenizer.encode(answer_text, add_special_tokens=False))
+    # Match training: append [SEG] to answer
+    token_answer_id = preprocess_referring_instruction(answer_text, tokenizer)
     refer_embedding_indices = torch.zeros_like(input_ids)
     refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
     answer_embedding_indices = torch.zeros_like(input_ids)

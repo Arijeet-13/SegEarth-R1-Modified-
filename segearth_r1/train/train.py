@@ -439,7 +439,14 @@ def train():
 
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32), device=training_args.device)
+        
+        # Cast model but keep precision-sensitive components in float32
         model.to(dtype=torch.bfloat16 if training_args.bf16 else (torch.float16 if training_args.fp16 else torch.float32))
+        if hasattr(model, 'predictor') and hasattr(model.predictor, 'criterion'):
+            model.predictor.criterion.float()  # Keep loss computation in float32
+        if hasattr(model, 'pixel_decoder'):
+            model.pixel_decoder.float()  # Keep pixel decoder in float32 for stability
+        
         data_args.is_multimodal = True
 
         model.config.image_aspect_ratio = data_args.image_aspect_ratio 

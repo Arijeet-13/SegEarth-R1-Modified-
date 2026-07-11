@@ -156,12 +156,11 @@ def _mask_confidence(result: dict) -> float:
             return 0.0
         return float(pred.sigmoid()[fg].mean())
 
-    pred = result["pred_masks"]
-    pred = pred[0] if pred.dim() == 3 else pred
-    fg = pred > 0
-    if fg.sum() == 0:
-        return 0.0
-    return float(pred.sigmoid()[fg].mean())
+    raw = result.get("raw_masks")  # logits before sigmoid
+    if raw is None:
+        return 0.0  # no confidence signal available
+    pred = raw[0] if raw.dim() == 3 else raw
+    return float(pred.sigmoid().mean())  # proper confidence from logits
 
 
 @torch.no_grad()

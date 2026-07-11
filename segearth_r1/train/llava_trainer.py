@@ -251,7 +251,7 @@ class LLaVATrainer(Trainer):
             original_requires_grad = {p: p.requires_grad for p in self.model.parameters()}
 
             # Put on the same GPU device as policy model
-            self.ref_device = self.args.device
+            self.ref_device = 'cpu'
             self.ref_model.requires_grad_(False).eval()
             self.ref_model.to(self.ref_device)
 
@@ -506,6 +506,10 @@ class LLaVATrainer(Trainer):
                 del ref_outputs, ref_log_probs
                 torch.cuda.empty_cache()
                 gc.collect()
+
+                if self.ref_device == 'cpu':
+                    self.ref_model.to('cpu')
+                    torch.cuda.empty_cache()
 
                 rollouts.append({
                     "output_ids": output_ids,

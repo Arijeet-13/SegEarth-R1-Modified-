@@ -186,10 +186,7 @@ def predict_masks_given_answers(
 
     # Pre-warm the vision-tower cache with the single image so the backbone
     # runs exactly once regardless of how many candidates are in the batch.
-    model._cached_raw_features = None
-    with torch.no_grad():
-        _ = model.run_vision_tower(batch["images"].float())
-
+    # Vision features computed fresh per call now (no persistent cache)
     outputs = model.eval_seg(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],

@@ -298,7 +298,6 @@ def evaluation():
             else:
                 if 'token_answer_id' in inputs:
                     inputs['token_answer_id'] = [ids.to(device) for ids in inputs['token_answer_id']]
-                    model._cached_raw_features = None
                     outputs = model.eval_seg(
                         input_ids=inputs['input_ids'],
                         attention_mask=inputs['attention_mask'],
@@ -311,7 +310,6 @@ def evaluation():
                         answer_embedding_indices=inputs['answer_embedding_indices']
                         )
                 else:
-                    model._cached_raw_features = None
                     outputs = model.eval_seg(
                         input_ids=inputs['input_ids'],
                         attention_mask=inputs['attention_mask'],

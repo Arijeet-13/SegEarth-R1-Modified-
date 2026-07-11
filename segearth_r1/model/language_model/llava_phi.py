@@ -203,17 +203,13 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
     # def mask_token_processor()
 
     def run_vision_tower(self, images):
-        if getattr(self, '_cached_raw_features', None) is None:
+        # Removed persistent cache - compute fresh or detect GRPO identical-copy pattern per call
+        if isinstance(images, torch.Tensor) and images.dim() == 4 and images.shape[0] > 1 and torch.equal(images[0:1].expand_as(images), images):
+            # GRPO rollout: batch is G copies of one image — run backbone once, repeat
             with torch.no_grad():
-                if isinstance(images, torch.Tensor) and images.dim() == 4 and images.shape[0] > 1 and torch.equal(images[0:1].expand_as(images), images):
-                    # GRPO rollout: batch is G copies of one image — run backbone once
-                    raw = self.get_model().get_vision_tower()(images[0:1])
-                    self._cached_raw_features = tuple(
-                        f.repeat(images.shape[0], *([1] * (f.dim() - 1))) for f in raw
-                    )
-                else:
-                    self._cached_raw_features = self.get_model().get_vision_tower()(images)
-        return self._cached_raw_features
+                raw = self.get_model().get_vision_tower()(images[0:1])
+                return tuple(f.repeat(images.shape[0], *([1] * (f.dim() - 1))) for f in raw)
+        return self.get_model().get_vision_tower()(images)
 
     def get_vision_tower_feature(self, images):
         features = self.run_vision_tower(images)
@@ -776,7 +772,6 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         dataset_type: Optional[str] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        self._cached_raw_features = None
         if dataset_type is not None:
             assert all(item == dataset_type[0] for item in dataset_type), f'this batch contain different dataset_type: {dataset_type}'
             batch_dataset_type = dataset_type[0]
@@ -1088,7 +1083,6 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         # Reset the vision-tower feature cache unless the caller explicitly wants to reuse it
         # (e.g. parallel_scale_referring pre-populates the cache for a repeated image).
         if not _reuse_vision_cache:
-            self._cached_raw_features = None
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

@@ -120,11 +120,12 @@ class segearth_r1Model(LlavaMetaModel, PhiModel):
 class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaConfig
 
-    def __init__(self, config, mask_decoder_cfg=None, add_cross_attn=True, cross_attn_index=None, use_seg_query=False):
+    def __init__(self, config, mask_decoder_cfg=None, add_cross_attn=True, cross_attn_index=None, use_seg_query=False, use_multiscale_seg=True):
         super(segearth_r1, self).__init__(config)
 
         self.model = segearth_r1Model(config, mask_decoder_cfg)
         self.use_seg_query = use_seg_query
+        self.use_multiscale_seg = use_multiscale_seg  # Toggle for multi-scale SEG embedding
         self.init_config = config
         self.mask_decoder_cfg = mask_decoder_cfg
         self.cross_attn_index = cross_attn_index
@@ -858,17 +859,23 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             if seg_indices is not None:
                 SEG_embedding = self.get_SEG_embedding(hidden_states, seg_indices, return_all = True)
                 origin_SEG_embedding = torch.cat([self.origin_SEG_token_projector(kk.unsqueeze(0)[:, 0:1]) for kk in SEG_embedding])
-                target_size = image_features["res5"].shape[-2:]
-                res3_down = F.interpolate(image_features["res3"], size=target_size, mode='bilinear', align_corners=False)
-                res4_down = F.interpolate(image_features["res4"], size=target_size, mode='bilinear', align_corners=False)
-                res5_feat = image_features["res5"]
-                res3_vision = res3_down.flatten(2).permute(0, 2, 1)
-                res3_vision = self.local_project_res3(res3_vision)
-                res4_vision = res4_down.flatten(2).permute(0, 2, 1)
-                res4_vision = self.local_project_res4(res4_vision)
-                res5_vision = res5_feat.flatten(2).permute(0, 2, 1)
-                res5_vision = self.local_project_res5(res5_vision)
-                local_vision = torch.cat([res3_vision, res4_vision, res5_vision], dim=1)
+                
+                if self.use_multiscale_seg:
+                    target_size = image_features["res5"].shape[-2:]
+                    res3_down = F.interpolate(image_features["res3"], size=target_size, mode='bilinear', align_corners=False)
+                    res4_down = F.interpolate(image_features["res4"], size=target_size, mode='bilinear', align_corners=False)
+                    res5_feat = image_features["res5"]
+                    res3_vision = res3_down.flatten(2).permute(0, 2, 1)
+                    res3_vision = self.local_project_res3(res3_vision)
+                    res4_vision = res4_down.flatten(2).permute(0, 2, 1)
+                    res4_vision = self.local_project_res4(res4_vision)
+                    res5_vision = res5_feat.flatten(2).permute(0, 2, 1)
+                    res5_vision = self.local_project_res5(res5_vision)
+                    local_vision = torch.cat([res3_vision, res4_vision, res5_vision], dim=1)
+                else:
+                    res5_vision = image_features["res5"].flatten(2).permute(0, 2, 1)
+                    local_vision = self.local_project(res5_vision)
+                
                 new_SEG_embedding = []
                 for batch_idx, cur_SEG_embedding in enumerate(SEG_embedding):
                     cur_SEG_embedding = self.text_projector(cur_SEG_embedding.unsqueeze(0))
@@ -1166,33 +1173,45 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         if seg_indices is not None:  
             SEG_embedding = self.get_SEG_embedding(hidden_states, seg_indices, return_all = True)
             origin_SEG_embedding = torch.cat([self.origin_SEG_token_projector(kk.unsqueeze(0)[:, 0:1]) for kk in SEG_embedding])
-            B = image_features["res5"].shape[0]
-            target_size = image_features["res5"].shape[-2:]  # e.g., (32, 32)
+            
+            if self.use_multiscale_seg:
+                # Multi-scale feature fusion
+                B = image_features["res5"].shape[0]
+                target_size = image_features["res5"].shape[-2:]
 
-            # Downsample higher-res features to res5's spatial size
-            res3_down = F.interpolate(image_features["res3"], size=target_size, mode='bilinear', align_corners=False)
-            res4_down = F.interpolate(image_features["res4"], size=target_size, mode='bilinear', align_corners=False)
-            res5_feat = image_features["res5"]
+                res3_down = F.interpolate(image_features["res3"], size=target_size, mode='bilinear', align_corners=False)
+                res4_down = F.interpolate(image_features["res4"], size=target_size, mode='bilinear', align_corners=False)
+                res5_feat = image_features["res5"]
 
-            # Flatten and project
-            res3_vision = res3_down.flatten(2).permute(0, 2, 1)   # [B, 1024, 256]
-            res3_vision = self.local_project_res3(res3_vision.to(dtype=self.local_project_res3.weight.dtype))      # [B, 1024, 512]
+                res3_vision = res3_down.flatten(2).permute(0, 2, 1)
+                res3_vision = self.local_project_res3(res3_vision.to(dtype=self.local_project_res3.weight.dtype))
 
-            res4_vision = res4_down.flatten(2).permute(0, 2, 1)   # [B, 1024, 512]
-            res4_vision = self.local_project_res4(res4_vision.to(dtype=self.local_project_res4.weight.dtype))      # [B, 1024, 512]
+                res4_vision = res4_down.flatten(2).permute(0, 2, 1)
+                res4_vision = self.local_project_res4(res4_vision.to(dtype=self.local_project_res4.weight.dtype))
 
-            res5_vision = res5_feat.flatten(2).permute(0, 2, 1)    # [B, 1024, 1024]
-            res5_vision = self.local_project_res5(res5_vision.to(dtype=self.local_project_res5.weight.dtype))      # [B, 1024, 512]
+                res5_vision = res5_feat.flatten(2).permute(0, 2, 1)
+                res5_vision = self.local_project_res5(res5_vision.to(dtype=self.local_project_res5.weight.dtype))
 
-            # Concatenate: [B, 3072, 512] — only 3× the original, not 21×
-            local_vision = torch.cat([res3_vision, res4_vision, res5_vision], dim=1)
-            new_SEG_embedding = []
-            for batch_idx, cur_SEG_embedding in enumerate(SEG_embedding):
-                cur_SEG_embedding = self.text_projector(cur_SEG_embedding.unsqueeze(0))
-                cur_SEG_embedding = self.d_layers(latents=cur_SEG_embedding.unsqueeze(1), 
-                    x=local_vision[batch_idx:batch_idx+1].unsqueeze(1))
-                new_SEG_embedding.append(cur_SEG_embedding)
-            new_SEG_embedding = torch.cat(new_SEG_embedding, dim=0)
+                local_vision = torch.cat([res3_vision, res4_vision, res5_vision], dim=1)
+                new_SEG_embedding = []
+                for batch_idx, cur_SEG_embedding in enumerate(SEG_embedding):
+                    cur_SEG_embedding = self.text_projector(cur_SEG_embedding.unsqueeze(0))
+                    cur_SEG_embedding = self.d_layers(latents=cur_SEG_embedding.unsqueeze(1), 
+                        x=local_vision[batch_idx:batch_idx+1].unsqueeze(1))
+                    new_SEG_embedding.append(cur_SEG_embedding)
+                new_SEG_embedding = torch.cat(new_SEG_embedding, dim=0)
+            else:
+                # Single-scale: use only res5
+                res5_vision = image_features["res5"].flatten(2).permute(0, 2, 1)
+                res5_vision = self.local_project(res5_vision.to(dtype=self.local_project.weight.dtype))
+                new_SEG_embedding = []
+                for batch_idx, cur_SEG_embedding in enumerate(SEG_embedding):
+                    cur_SEG_embedding = self.text_projector(cur_SEG_embedding.unsqueeze(0))
+                    cur_SEG_embedding = self.d_layers(latents=cur_SEG_embedding.unsqueeze(1),
+                        x=res5_vision[batch_idx:batch_idx+1].unsqueeze(1))
+                    new_SEG_embedding.append(cur_SEG_embedding)
+                new_SEG_embedding = torch.cat(new_SEG_embedding, dim=0)
+            
             SEG_embedding = torch.cat((origin_SEG_embedding, new_SEG_embedding), dim=-1)
             SEG_embedding = self.SEG_token_projector(SEG_embedding)  
         else:

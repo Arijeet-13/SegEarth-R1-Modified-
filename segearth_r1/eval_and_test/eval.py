@@ -218,7 +218,9 @@ def evaluation():
     eval_dataloader = DataLoader(eval_dataset, batch_size=dataloader_params['batch_size'], collate_fn=data_collator,
                                  num_workers=dataloader_params['num_workers'])
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model.to(device=device,dtype=torch.float).eval()
+    # Use same dtype as training (bf16 if supported, else fp16)
+    eval_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    model.to(device=device, dtype=eval_dtype).eval()
     intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
     union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)

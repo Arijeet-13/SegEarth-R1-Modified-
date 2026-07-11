@@ -331,6 +331,7 @@ class LLaVATrainer(Trainer):
         # We need to run generation and reward calculation under no_grad
         with torch.no_grad():
             for b_idx in range(batch_size):
+                self.model._cached_raw_features = None
                 print(f"[ITER] entering b_idx={b_idx}", flush=True)
                 input_ids = inputs['input_ids'][b_idx]
                 labels = inputs['labels'][b_idx]
@@ -415,17 +416,21 @@ class LLaVATrainer(Trainer):
                 batch["token_refer_id"] = [t.to(device) for t in batch["token_refer_id"]]
                 batch["token_answer_id"] = [t.to(device) for t in batch["token_answer_id"]]
 
-                outputs_seg = self.model.eval_seg(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    images=batch["images"].to(dtype=next(self.model.get_model().get_vision_tower().parameters()).dtype),
-                    masks=None,
-                    token_refer_id=batch["token_refer_id"],
-                    refer_embedding_indices=batch["refer_embedding_indices"],
-                    labels=batch["labels"],
-                    token_answer_id=batch["token_answer_id"],
-                    answer_embedding_indices=batch["answer_embedding_indices"],
-                )
+                self.model._cached_raw_features = None
+                _ = self.model.run_vision_tower(batch["images"].to(dtype=next(self.model.get_model().get_vision_tower().parameters()).dtype))
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    outputs_seg = self.model.eval_seg(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        images=batch["images"].to(dtype=next(self.model.get_model().get_vision_tower().parameters()).dtype),
+                        masks=None,
+                        token_refer_id=batch["token_refer_id"],
+                        refer_embedding_indices=batch["refer_embedding_indices"],
+                        labels=batch["labels"],
+                        token_answer_id=batch["token_answer_id"],
+                        answer_embedding_indices=batch["answer_embedding_indices"],
+                        _reuse_vision_cache=True,
+                    )
                 
                 # Clear CUDA cache after mask prediction
                 torch.cuda.empty_cache()
@@ -490,13 +495,13 @@ class LLaVATrainer(Trainer):
                 rd = self.args.device
                 with self.compute_loss_context_manager():
                     ref_outputs = self.ref_model(
-                        input_ids=output_ids.to(rd),
-                        images=images_batched.to(rd),
-                        token_refer_id=[t.to(rd) for t in token_refer_id_batched] if token_refer_id_batched is not None else None,
-                        refer_embedding_indices=refer_embedding_indices_full_batched.to(rd) if refer_embedding_indices_full_batched is not None else None
-                    )
+                    input_ids=output_ids.to(rd),
+                    images=images_batched.to(rd),
+                    token_refer_id=[t.to(rd) for t in token_refer_id_batched] if token_refer_id_batched is not None else None,
+                    refer_embedding_indices=refer_embedding_indices_full_batched.to(rd) if refer_embedding_indices_full_batched is not None else None
+                )
                 ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
-                ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_ids.to(rd).unsqueeze(-1)).squeeze(-1).to(device)
+                ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_ids.to(rd).unsqueeze(-1)).squeeze(-1).detach().to(device)
                 del ref_outputs, ref_log_probs
                 torch.cuda.empty_cache()
                 gc.collect()
@@ -553,7 +558,7 @@ class LLaVATrainer(Trainer):
             policy_loss = (-torch.min(surr1, surr2) * gen_attention_mask).sum(dim=-1) / denom  # [G]
 
             # Stable k3 KL Divergence Penalty
-            log_ratio = ref_token_log_probs - new_logp
+            log_ratio = torch.clamp(ref_token_log_probs - new_logp, -10.0, 10.0)
             kl = torch.exp(log_ratio) - 1 - log_ratio
             kl_loss = (self.args.kl_coeff * kl * gen_attention_mask).sum(dim=-1) / denom  # [G]
 

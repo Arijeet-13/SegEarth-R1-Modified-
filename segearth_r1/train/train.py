@@ -95,6 +95,7 @@ class ModelArguments:
     dino_path: Optional[str] = field(default=None)
     process_depth: Optional[int] = field(default=1)
     use_seg_query: bool = field(default=False)
+    use_multiscale_seg: bool = field(default=False)  # Deprecated - kept for compatibility
     mask2former_checkpoint: Optional[str] = field(default=None)
 
 @dataclass

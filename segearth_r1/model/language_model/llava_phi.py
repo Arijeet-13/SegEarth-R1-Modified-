@@ -795,26 +795,10 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_seg_query_masks, new_refer_embedding_indices, new_answer_embedding_indices, new_target_group_ids
     
     def get_SEG_embedding(self, hidden_states, refer_embedding_indices, return_all=False, target_group_ids=None):
-        """
-        Extract SEG token embeddings with optional multi-target fusion.
-        
-        Args:
-            hidden_states: [batch, seq_len, hidden_dim]
-            refer_embedding_indices: [batch, seq_len] - 0/1 mask for SEG tokens
-            return_all: whether to return all SEG tokens or just pooled
-            target_group_ids: [batch, seq_len] - target group IDs (0=not SEG, 1=target1, 2=target2, ...)
-                             Only used when use_multi_target_seg=True
-        
-        Returns:
-            If use_multi_target_seg=False: same as before (pooled embedding per sample)
-            If use_multi_target_seg=True: list of [num_targets, hidden_dim] per sample
-        """
         refer_embedding_list = []
         
         for batch_idx, (current_hidden_state, current_token_indice) in enumerate(zip(hidden_states, refer_embedding_indices)):
-            # Guard against empty selection (SEG token truncated/missing)
             if current_token_indice.sum() == 0:
-                # Return zero embedding to avoid NaN from pooling empty tensor
                 empty_embedding = torch.zeros(1, current_hidden_state.shape[-1], 
                                              device=current_hidden_state.device, 
                                              dtype=current_hidden_state.dtype)
@@ -823,7 +807,6 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             
             current_refer_state = current_hidden_state[current_token_indice.bool()]
             
-            # Multi-target mode: group tokens by target and fuse with learned weights
             if self.use_multi_target_seg and self.multiseg_scalar is not None and target_group_ids is not None:
                 current_group_ids = target_group_ids[batch_idx][current_token_indice.bool()]
                 unique_targets = torch.unique(current_group_ids[current_group_ids > 0])  # Skip 0 (non-target)

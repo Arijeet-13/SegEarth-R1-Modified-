@@ -423,7 +423,6 @@ class ReasonSegDataset(Dataset):
         return data_dict   
     
 class DataCollector(object):
-    """Collate examples for supervised fine-tuning."""
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 

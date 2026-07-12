@@ -218,7 +218,6 @@ def evaluation():
     eval_dataloader = DataLoader(eval_dataset, batch_size=dataloader_params['batch_size'], collate_fn=data_collator,
                                  num_workers=dataloader_params['num_workers'])
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # Keep model in float32, will use autocast for inference
     model.to(device=device, dtype=torch.float32).eval()
     intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
     union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
@@ -233,7 +232,9 @@ def evaluation():
             gt = inputs["masks"]
             inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
             inputs['token_refer_id'] = [ids.to(device) for ids in inputs['token_refer_id']]
-            if getattr(data_args, 'scaling_type', None) is not None:
+            
+            is_reasoning_eval = (inputs.get('dataset_type', [None])[0] == 'reason_seg')
+            if getattr(data_args, 'scaling_type', None) is not None or is_reasoning_eval:
                 from segearth_r1.eval_and_test.inference_scaling import (
                     parallel_scale_reasoning,
                     sequential_scale_reasoning,
@@ -241,42 +242,46 @@ def evaluation():
                     make_iou_oracle
                 )
                 outputs = []
-                # Process each item in the batch sequentially for ensembling
                 for b_idx in range(inputs['images'].shape[0]):
                     image_tensor = inputs['images'][b_idx:b_idx+1]
                     gt_mask_item = gt[b_idx].to(device)
-                    # Only use the oracle IoU function for explicit upper-bound analysis.
-                    # Passing oracle_iou_fn when use_oracle=False would let best_of_n/worst_of_n
-                    # cheat by selecting candidates using ground-truth labels.
                     oracle_iou_fn = make_iou_oracle(gt_mask_item) if data_args.use_oracle else None
                     
-                    if data_args.scaling_type == "parallel_reasoning":
-                        # Decode the pre-tokenized question; drop the trailing [SEG] marker
-                        # that preprocess_referring_instruction always appends.
+                    scaling_type = data_args.scaling_type
+                    if scaling_type is None and is_reasoning_eval:
+                        scaling_type = "parallel_reasoning"
+                        scaling_n = 1
+                        scaling_temp = 0.0
+                        scaling_aggregator = "best_of_n"
+                    else:
+                        scaling_n = data_args.scaling_n
+                        scaling_temp = data_args.scaling_temp
+                        scaling_aggregator = data_args.scaling_aggregator
+                    
+                    if scaling_type == "parallel_reasoning":
                         question_ids = inputs['token_refer_id'][b_idx]
                         question = tokenizer.decode(question_ids[:-1], skip_special_tokens=True).strip()
                         
                         scaled_res = parallel_scale_reasoning(
                             model, tokenizer, image_tensor, question,
-                            n=data_args.scaling_n, temperature=data_args.scaling_temp,
-                            aggregator=data_args.scaling_aggregator, device=device,
+                            n=scaling_n, temperature=scaling_temp,
+                            aggregator=scaling_aggregator, device=device,
                             oracle_iou_fn=oracle_iou_fn
                         )
-                        # Format output to match the structure compute_metric expects
                         outputs.append({"pred_masks": scaled_res["mask"].cuda(), "scores": None})
                         
-                    elif data_args.scaling_type == "sequential_reasoning":
+                    elif scaling_type == "sequential_reasoning":
                         question_ids = inputs['token_refer_id'][b_idx]
                         question = tokenizer.decode(question_ids[:-1], skip_special_tokens=True).strip()
                         
                         scaled_res = sequential_scale_reasoning(
                             model, tokenizer, image_tensor, question,
-                            max_rounds=data_args.scaling_n, temperature=data_args.scaling_temp,
+                            max_rounds=scaling_n, temperature=scaling_temp,
                             device=device, oracle_iou_fn=oracle_iou_fn
                         )
                         outputs.append({"pred_masks": scaled_res["mask"].cuda(), "scores": None})
                         
-                    elif data_args.scaling_type == "parallel_referring":
+                    elif scaling_type == "parallel_referring":
                         question_ids = inputs['token_refer_id'][b_idx]
                         referring_text = tokenizer.decode(question_ids[:-1], skip_special_tokens=True).strip()
                         
@@ -287,20 +292,11 @@ def evaluation():
                             token_refer_id=[inputs['token_refer_id'][b_idx]],
                             refer_embedding_indices=inputs['refer_embedding_indices'][b_idx:b_idx+1],
                             labels=inputs['labels'][b_idx:b_idx+1],
-                            n=data_args.scaling_n,
-                            aggregator=data_args.scaling_aggregator,
-                            flip_prob=data_args.flip_prob,
-                            referring_text=referring_text,
-                            device=device,
-                            oracle_iou_fn=oracle_iou_fn
+                            n=scaling_n,
+                            device=device
                         )
                         outputs.append({"pred_masks": scaled_res["mask"].cuda(), "scores": None})
             else:
-                # Standard evaluation: pass through to eval_seg
-                # The ground-truth answer tokens are causally safe because:
-                # - SEG embedding is extracted from <refer> token (in human turn)
-                # - <refer> cannot attend to <answer> (in assistant turn) due to causal masking
-                # - Therefore, passing token_answer_id doesn't leak information to mask prediction
                 if 'token_answer_id' in inputs:
                     inputs['token_answer_id'] = [ids.to(device) for ids in inputs['token_answer_id']]
                     outputs = model.eval_seg(
@@ -326,14 +322,13 @@ def evaluation():
                         token_answer_id=None,
                         answer_embedding_indices=None
                         )
-            # vis
             if data_args.vis_path is not None:
                 os.makedirs(data_args.vis_path, exist_ok=True)
                 for vis_idx, image_name in enumerate(inputs['image_name']):
                     gt_mask = inputs['masks'][vis_idx].squeeze(0) * 255
                     pred_mask = outputs[vis_idx]['pred_masks'] * 255
                     if pred_mask.dim() == 3:
-                        pred_mask = pred_mask[0]   # take top-scoring query for multi-mask outputs
+                        pred_mask = pred_mask[0]
                     gt_mask_np = gt_mask.cpu().numpy().astype(np.uint8)
                     pred_mask_np = pred_mask.cpu().numpy().astype(np.uint8)
                     gt_mask_root = os.path.join(data_args.vis_path, image_name + "_gt.png")

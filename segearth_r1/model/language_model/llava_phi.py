@@ -892,6 +892,7 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         target_group_ids: Optional[torch.LongTensor] = None,  # For multi-target: group ID per token
         dataset_type: Optional[str] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        num_logits_to_keep: int = 0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if dataset_type is not None:
             assert all(item == dataset_type[0] for item in dataset_type), f'this batch contain different dataset_type: {dataset_type}'
@@ -925,8 +926,9 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict
         ) 
-        hidden_states = outputs.last_hidden_state
-        logits = self.lm_head(hidden_states)
+        hidden_states = outputs[0]
+        logits_input = hidden_states[:, -num_logits_to_keep:, :] if num_logits_to_keep > 0 else hidden_states
+        logits = self.lm_head(logits_input)
 
         loss = None
         if batch_dataset_type == 'mm_conv' or batch_dataset_type == 'reason_seg': 

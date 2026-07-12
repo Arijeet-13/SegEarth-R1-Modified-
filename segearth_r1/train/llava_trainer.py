@@ -187,7 +187,6 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 
 class LLaVATrainer(Trainer):
     def compute_iou_reward(self, pred_mask, gt_mask):
-        """Task-driven outcome reward (Intersection over Union)."""
         pred = (pred_mask > 0.5).float()
         gt = (gt_mask > 0.5).float()
         intersection = (pred * gt).sum()
@@ -195,7 +194,6 @@ class LLaVATrainer(Trainer):
         return float(intersection / (union + 1e-8))
 
     def compute_soft_iou_reward(self, pred_prob, gt_mask):
-        """Soft IoU reward using continuous sigmoid probabilities."""
         gt = (gt_mask > 0.5).float()
         intersection = (pred_prob * gt).sum()
         union = pred_prob.sum() + gt.sum() - intersection
@@ -212,7 +210,6 @@ class LLaVATrainer(Trainer):
         num_steps = len(train_dl) * int(self.args.num_train_epochs) * ppo_epochs
         
         if not hasattr(self, 'ref_model'):
-            # Temporary detachment of heavy submodules to avoid deepcopy memory overhead
             detached_attrs = {}
             model_attrs = ['predictor', 'pixel_decoder', 'seg_query_projector',
                            'local_project_res3', 'local_project_res4', 'local_project_res5',
@@ -231,36 +228,29 @@ class LLaVATrainer(Trainer):
                     detached_inner[attr] = getattr(inner_model, attr)
                     setattr(inner_model, attr, None)
 
-            # Deepcopy only the lightweight LLM backbone
             self.ref_model = copy.deepcopy(self.model)
+            self.deep_copied_param_names = {n for n, _ in self.ref_model.named_parameters()}
 
-            # Restore on self.model (policy model)
             for attr, val in detached_attrs.items():
                 setattr(self.model, attr, val)
             for attr, val in detached_inner.items():
                 setattr(inner_model, attr, val)
 
-            # Share by reference on self.ref_model
             for attr, val in detached_attrs.items():
                 setattr(self.ref_model, attr, val)
             inner_ref = self.ref_model.get_model() if hasattr(self.ref_model, 'get_model') else self.ref_model
             for attr, val in detached_inner.items():
                 setattr(inner_ref, attr, val)
 
-            # Save policy model's original requires_grad status before ref_model is frozen
             original_requires_grad = {p: p.requires_grad for p in self.model.parameters()}
-
-            # Put on the same GPU device as policy model
             self.ref_device = 'cpu'
             self.ref_model.requires_grad_(False).eval()
-            self.ref_model.to(self.ref_device)
-
-            # Restore original requires_grad status on self.model's parameters
             for p, req in original_requires_grad.items():
                 p.requires_grad = req
-            
+
             gc.collect()
             torch.cuda.empty_cache()
+
 
         self.create_optimizer_and_scheduler(num_training_steps=num_steps)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
@@ -290,7 +280,6 @@ class LLaVATrainer(Trainer):
                 for ep in range(ppo_epochs):
                     self.model.train()
                     loss = self._grpo_loss(rollout)
-                    self.accelerator.backward(loss)
                     self.accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
                     self.optimizer.step()
                     if self.lr_scheduler is not None:
@@ -299,7 +288,7 @@ class LLaVATrainer(Trainer):
                     self.state.global_step += 1
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
                     if self.state.global_step % self.args.logging_steps == 0:
-                        logs = {"grpo_loss": loss.item(), "ppo_epoch": ep,
+                        logs = {"grpo_loss": loss, "ppo_epoch": ep,
                                 "learning_rate": self.optimizer.param_groups[0]['lr'] if self.optimizer else self.args.learning_rate}
                         self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
                         self.log(logs)
@@ -382,7 +371,7 @@ class LLaVATrainer(Trainer):
                             do_sample=True,
                             temperature=getattr(self.args, "grpo_temperature", 1.0),
                             max_new_tokens=32,
-                            return_dict_in_generate=True,
+                            return_dict_in_generate=True
                         )
                 finally:
                     if _had_forward_override:
@@ -390,11 +379,6 @@ class LLaVATrainer(Trainer):
                     else:
                         del self.model.forward
 
-                # HF's `generate()` already returns a single padded [G, total_len] tensor
-                # when return_dict_in_generate=True, so outputs.sequences needs no further
-                # padding here. (The old code referenced an undefined `outputs_list` /
-                # `pad_token_id` and would crash with NameError as soon as generate()
-                # succeeded.)
                 output_ids = outputs.sequences  # [G, total_len]
                 gen_ids = output_ids[:, prompt_ids.size(0):]  # [G, gen_len]
                 gen_len = gen_ids.shape[1]
@@ -492,23 +476,30 @@ class LLaVATrainer(Trainer):
                 old_logp = torch.nn.functional.log_softmax(new_logits, -1)[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1).detach()
                 del new_logits
 
-                # Log probabilities under reference policy (no gradient - for KL penalty)
                 rd = self.args.device
+                for n, p in self.ref_model.named_parameters():
+                    if n in self.deep_copied_param_names:
+                        p.data = p.data.to(rd, non_blocking=True)
+
+                self.ref_model._cached_raw_features = None
                 with self.compute_loss_context_manager():
                     ref_outputs = self.ref_model(
-                    input_ids=output_ids.to(rd),
-                    images=images_batched.to(rd),
-                    token_refer_id=[t.to(rd) for t in token_refer_id_batched] if token_refer_id_batched is not None else None,
-                    refer_embedding_indices=refer_embedding_indices_full_batched.to(rd) if refer_embedding_indices_full_batched is not None else None
-                )
+                        input_ids=output_ids,
+                        images=images_batched,
+                        token_refer_id=token_refer_id_batched,
+                        refer_embedding_indices=refer_embedding_indices_full_batched
+                    )
                 ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
-                ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_ids.to(rd).unsqueeze(-1)).squeeze(-1).detach().to(device)
+                ref_token_log_probs = ref_log_probs[:, -gen_len-1:-1].gather(2, gen_ids.unsqueeze(-1)).squeeze(-1).detach()
                 del ref_outputs, ref_log_probs
+
+                for n, p in self.ref_model.named_parameters():
+                    if n in self.deep_copied_param_names:
+                        p.data = p.data.to('cpu')
                 torch.cuda.empty_cache()
                 gc.collect()
 
                 if self.ref_device == 'cpu':
-                    self.ref_model.to('cpu')
                     torch.cuda.empty_cache()
 
                 rollouts.append({
@@ -526,7 +517,7 @@ class LLaVATrainer(Trainer):
         return rollouts if rollouts else None
 
     def _grpo_loss(self, rollouts: List[dict]) -> torch.Tensor:
-        total_loss_accumulated = 0.0
+        total_loss_value = 0.0
         
         for rollout in rollouts:
             output_ids = rollout["output_ids"]                    # [G, total_len]
@@ -540,6 +531,7 @@ class LLaVATrainer(Trainer):
             ref_token_log_probs = rollout["ref_token_log_probs"]
 
             # Log probabilities under active policy (GRADIENTS ENABLED)
+            self.model._cached_raw_features = None
             with self.compute_loss_context_manager():
                 new_logits = self.model(
                     input_ids=output_ids, 
@@ -568,11 +560,11 @@ class LLaVATrainer(Trainer):
             kl_loss = (self.args.kl_coeff * kl * gen_attention_mask).sum(dim=-1) / denom  # [G]
 
             # Total loss averaged over group size
-            total_loss = (policy_loss + kl_loss).mean()
-            
-            total_loss_accumulated += total_loss
-            
-        return total_loss_accumulated / len(rollouts)
+            loss = (policy_loss + kl_loss).mean() / len(rollouts)  # scale for averaging
+            self.accelerator.backward(loss)   # backward NOW, graph freed immediately after
+            total_loss_value += loss.item()
+            del new_logits, new_logp, ratio, policy_loss, kl_loss, loss
+        return total_loss_value
 
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         if not getattr(self.args, 'use_grpo', False):

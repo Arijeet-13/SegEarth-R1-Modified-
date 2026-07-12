@@ -1324,6 +1324,11 @@ class segearth_r1(PhiForCausalLM, LlavaMetaForCausalLM):
         else:
             seg_query = None
         image_features = self.get_vision_tower_feature(images)
+        
+        # Cast to pixel_decoder dtype (same as in forward())
+        pixel_dec_dtype = next(self.pixel_decoder.parameters()).dtype if list(self.pixel_decoder.parameters()) else torch.float32
+        image_features = {k: v.to(dtype=pixel_dec_dtype) for k, v in image_features.items()}
+        
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
 

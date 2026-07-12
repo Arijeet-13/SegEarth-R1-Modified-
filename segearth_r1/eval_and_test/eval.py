@@ -296,7 +296,10 @@ def evaluation():
                         )
                         outputs.append({"pred_masks": scaled_res["mask"].cuda(), "scores": None})
             else:
-                if 'token_answer_id' in inputs:
+                # For referring segmentation (RefSegRS, RRSIS-D): use refer_embedding_indices only
+                # For reasoning segmentation (EarthReason, Liss4Reason): should NOT pass ground-truth answers during eval
+                # Only pass token_answer_id if it's a referring task (not reasoning task)
+                if 'token_answer_id' in inputs and inputs.get('dataset_type', [None])[0] == 'refer_seg':
                     inputs['token_answer_id'] = [ids.to(device) for ids in inputs['token_answer_id']]
                     outputs = model.eval_seg(
                         input_ids=inputs['input_ids'],
@@ -310,6 +313,7 @@ def evaluation():
                         answer_embedding_indices=inputs['answer_embedding_indices']
                         )
                 else:
+                    # Reasoning segmentation: only use question, NOT ground-truth answer
                     outputs = model.eval_seg(
                         input_ids=inputs['input_ids'],
                         attention_mask=inputs['attention_mask'],

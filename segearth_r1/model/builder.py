@@ -43,9 +43,35 @@ def load_pretrained_model(model_path, model_base, model_name, model_args, mask_c
     mask_cfg = get_mask_config(mask_config)
     mask_cfg.MODEL.MASK_FORMER.SEG_TASK = model_args.seg_task if hasattr(model_args, 'seg_task') else 'instance'
 
+    use_multi_target_seg = getattr(model_args, 'use_multi_target_seg', False) if model_args is not None else False
+    seg_token_num = getattr(model_args, 'seg_token_num', 1) if model_args is not None else 1
+
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    if "[SEG]" not in tokenizer.get_vocab():
+        tokenizer.add_tokens("[SEG]")
+    
+    if use_multi_target_seg and "<seg_m>" not in tokenizer.get_vocab():
+        tokenizer.add_tokens("<seg_m>")
+
     print(f'current model is {model_map_name}')
-    model = segearth_r1.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, use_seg_query = use_seg_query, **kwargs)
+    model = segearth_r1.from_pretrained(
+        model_path,
+        mask_decoder_cfg=mask_cfg,
+        use_seg_query=use_seg_query,
+        use_multi_target_seg=use_multi_target_seg,
+        seg_token_num=seg_token_num,
+        **kwargs
+    )
+    model.resize_token_embeddings(len(tokenizer))
+    
+    seg_m_kwargs = {}
+    if use_multi_target_seg:
+        seg_m_kwargs['SEG_M'] = tokenizer("<seg_m>", return_tensors='pt', add_special_tokens=False)['input_ids']
+    model.get_special_token(
+        SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'],
+        EOS=tokenizer.eos_token_id,
+        **seg_m_kwargs
+    )
 
     vision_tower = model.get_vision_tower()
         

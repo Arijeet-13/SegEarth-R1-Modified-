@@ -77,17 +77,19 @@ def sample_reasoning_answers(
     all_ids = []
     for i in range(0, n_samples, chunk):
         g = min(chunk, n_samples - i)
-        out = model.generate(
-            input_ids_batched[i:i+g],
-            attention_mask=attention_mask_batched[i:i+g],
-            pad_token_id=pad_token_id,
-            images=image_tensor_batched[i:i+g],
-            do_sample=temperature > 0,
-            temperature=max(temperature, 1e-5),
-            top_p=top_p,
-            max_new_tokens=max_new_tokens,
-            use_cache=True,
-        )
+        gen_kwargs = {
+            "input_ids": input_ids_batched[i:i+g],
+            "attention_mask": attention_mask_batched[i:i+g],
+            "pad_token_id": pad_token_id,
+            "images": image_tensor_batched[i:i+g],
+            "do_sample": temperature > 0,
+            "max_new_tokens": max_new_tokens,
+            "use_cache": True,
+        }
+        if temperature > 0:
+            gen_kwargs["temperature"] = temperature
+            gen_kwargs["top_p"] = top_p
+        out = model.generate(**gen_kwargs)
         all_ids.append(out)
         torch.cuda.empty_cache()
     output_ids = torch.cat(all_ids, dim=0)
@@ -150,12 +152,12 @@ def _mask_confidence(result: dict) -> float:
     # Fall back to mean sigmoid probability over raw logits (not binarized masks)
     raw = result.get("raw_masks")
     if raw is None:
-        print("[_mask_confidence] WARNING: No raw_masks available, returning 0.0")
+        # print("[_mask_confidence] WARNING: No raw_masks available, returning 0.0")
         return 0.0  # no confidence signal available
     pred = raw[0] if raw.dim() == 3 else raw
     conf = float(pred.sigmoid().mean())
-    # Debug: print actual logit statistics
-    print(f"[_mask_confidence DEBUG] raw logit range: [{pred.min():.3f}, {pred.max():.3f}], mean: {pred.mean():.3f}, confidence: {conf:.6f}")
+    # Debug: print actual logit statistics (silenced)
+    # print(f"[_mask_confidence DEBUG] raw logit range: [{pred.min():.3f}, {pred.max():.3f}], mean: {pred.mean():.3f}, confidence: {conf:.6f}")
     return conf  # proper confidence from logits
 
 
@@ -245,8 +247,8 @@ def aggregate_best_of_n(
     else:
         scored = [(c["score"], c) for c in candidates]
     scored.sort(key=lambda x: x[0], reverse=True)
-    if scored[0][0] <= 1e-6:
-        print("[best_of_n] all candidates scored ~0 — degenerate batch")
+    # if scored[0][0] <= 1e-6:
+    #     print("[best_of_n] all candidates scored ~0 — degenerate batch")
     best = scored[0][1]
     return best["mask"], {"best_score": scored[0][0]}
 

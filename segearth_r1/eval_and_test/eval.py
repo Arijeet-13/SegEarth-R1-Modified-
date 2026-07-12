@@ -1,3 +1,12 @@
+# Hotfix for PyTorch / DeepSpeed distributed elasticity import compatibility bug
+import logging
+try:
+    import torch.distributed.elastic.agent.server.api
+    if not hasattr(torch.distributed.elastic.agent.server.api, 'log'):
+        torch.distributed.elastic.agent.server.api.log = logging.getLogger("torch.distributed.elastic.agent.server.api")
+except ImportError:
+    pass
+
 import os
 import cv2
 import torch
@@ -169,6 +178,8 @@ class DataArguments:
     scaling_aggregator: str = field(default="average")       # 'average', 'majority_vote', or 'best_of_n'
     flip_prob: float = field(default=0.5, metadata={"help": "Probability of horizontal flip for test-time augmentation (TTA) in referring segmentation."})
     use_oracle: bool = field(default=False, metadata={"help": "If True, pass ground-truth IoU oracle to best_of_n/worst_of_n for upper-bound analysis. Never use for real benchmark numbers."})
+    use_multi_target_seg: bool = field(default=False, metadata={"help": "Enable PixelLM-style multi-target [SEG_M] fusion."})
+    seg_token_num: int = field(default=1, metadata={"help": "Number of consecutive [SEG_M] tokens per target when use_multi_target_seg=True."})
 
 def evaluation():
     parser = transformers.HfArgumentParser(DataArguments)
@@ -181,36 +192,49 @@ def evaluation():
                                                           use_seg_query = data_args.use_seg_query, device='cuda')
     data_args.is_multimodal = True
     conversation_lib.default_conversation = conversation_lib.conv_templates[data_args.version]
-    if data_args.dataset_type == 'RRSIS-D':
-        eval_dataset = RRSISDDataset(
+    if data_args.use_multi_target_seg and data_args.dataset_type == 'MUSE':
+        from segearth_r1.train.train_dataset import MUSEDataset, MultiTargetDataCollector
+        eval_dataset = MUSEDataset(
             base_data_path=data_args.base_data_path,
             tokenizer=tokenizer,
-            split = data_args.data_split,
+            seg_token_num=data_args.seg_token_num,
+            split=data_args.data_split
         )
-    elif data_args.dataset_type == 'EarthReason':
-        eval_dataset = ReasonSegDataset(
-            base_data_path=data_args.base_data_path,
-            tokenizer=tokenizer,
-            split=data_args.data_split,
-        )
-    elif data_args.dataset_type == 'Liss4Reason':
-        eval_dataset = Liss4ReasonSegDataset(
-            base_data_path=data_args.base_data_path,
-            tokenizer=tokenizer,
-            split=data_args.data_split,
-        )
-    elif data_args.dataset_type == 'RefSegRS':
-        eval_dataset = RefSegRSDataset(
-            base_data_path=data_args.base_data_path,
-            tokenizer=tokenizer,
-            split=data_args.data_split,
-        )
+        data_collator = MultiTargetDataCollector(tokenizer=tokenizer)
     else:
-        raise ValueError(f"Unknown dataset_type: '{data_args.dataset_type}'. "
-                         f"Expected one of: RRSIS-D, EarthReason, Liss4Reason, RefSegRS")
-    data_collator = DataCollector(
-        tokenizer=tokenizer,
-    )
+        if data_args.use_multi_target_seg:
+            print(f"Warning: Multi-target dataset only supported for MUSE, but dataset_type is {data_args.dataset_type}. Falling back to standard dataset class.")
+            
+        if data_args.dataset_type == 'RRSIS-D':
+            eval_dataset = RRSISDDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                split=data_args.data_split,
+            )
+        elif data_args.dataset_type == 'EarthReason':
+            eval_dataset = ReasonSegDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                split=data_args.data_split,
+            )
+        elif data_args.dataset_type == 'Liss4Reason':
+            eval_dataset = Liss4ReasonSegDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                split=data_args.data_split,
+            )
+        elif data_args.dataset_type == 'RefSegRS':
+            eval_dataset = RefSegRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                split=data_args.data_split,
+            )
+        else:
+            raise ValueError(f"Unknown dataset_type: '{data_args.dataset_type}'. "
+                             f"Expected one of: RRSIS-D, EarthReason, Liss4Reason, RefSegRS, MUSE")
+        data_collator = DataCollector(
+            tokenizer=tokenizer,
+        )
     dataloader_params = {
         "batch_size": data_args.eval_batch_size,
         "num_workers": data_args.dataloader_num_workers,
@@ -299,6 +323,9 @@ def evaluation():
             else:
                 if 'token_answer_id' in inputs:
                     inputs['token_answer_id'] = [ids.to(device) for ids in inputs['token_answer_id']]
+                    tgi = None
+                    if 'target_group_ids' in inputs and inputs['target_group_ids'] is not None:
+                        tgi = [ids.to(device) for ids in inputs['target_group_ids']]
                     outputs = model.eval_seg(
                         input_ids=inputs['input_ids'],
                         attention_mask=inputs['attention_mask'],
@@ -308,7 +335,8 @@ def evaluation():
                         refer_embedding_indices=inputs['refer_embedding_indices'],
                         labels=inputs['labels'],
                         token_answer_id=inputs['token_answer_id'],
-                        answer_embedding_indices=inputs['answer_embedding_indices']
+                        answer_embedding_indices=inputs['answer_embedding_indices'],
+                        target_group_ids=tgi
                         )
                 else:
                     outputs = model.eval_seg(

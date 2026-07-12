@@ -22,6 +22,7 @@ from torch.utils.data import Dataset
 from segearth_r1 import conversation as conversation_lib
 from segearth_r1.model import *
 from segearth_r1.train.refer import REFER
+from pycocotools import mask
 from segearth_r1.mask_config.config import Config
 from fvcore.common.config import CfgNode
 
@@ -260,16 +261,16 @@ class RefSegRSDataset(Dataset):
         return data_dict
 
 class ReasonSegDataset(Dataset):
-    def __init__(self, base_data_path, tokenizer, image_size = 1024):
+    def __init__(self, base_data_path, tokenizer, image_size = 1024, split = 'train'):
         super(ReasonSegDataset, self).__init__()
         self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
         self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
         self.image_size = image_size
-        self.ReasonSeg_images_root = os.path.join(base_data_path, "rs_reason_seg/RSReasonSeg/train/images")
-        self.ReasonSeg_labels_root = os.path.join(base_data_path, "rs_reason_seg/RSReasonSeg/train/labels")
-        self.ReasonSeg_QAs_root = os.path.join(base_data_path, "rs_reason_seg/RSReasonSeg/train/QAs")
+        self.ReasonSeg_images_root = os.path.join(base_data_path, f"rs_reason_seg/RSReasonSeg/{split}/images")
+        self.ReasonSeg_labels_root = os.path.join(base_data_path, f"rs_reason_seg/RSReasonSeg/{split}/labels")
+        self.ReasonSeg_QAs_root = os.path.join(base_data_path, f"rs_reason_seg/RSReasonSeg/{split}/QAs")
         self.images = self.load_file_paths(self.ReasonSeg_images_root, valid_extensions=('.jpg', '.jpeg', '.png'))
         self.labels = self.load_file_paths(self.ReasonSeg_labels_root, valid_extensions=('.png',))
         self.QAs_paths = self.load_file_paths(self.ReasonSeg_QAs_root, valid_extensions=('.json', '.txt'))
@@ -548,9 +549,9 @@ class MultiTargetReasonSegDataset(Dataset):
     is agnostic to where the per-instance masks come from.
     """
     def __init__(self, base_data_path, tokenizer, image_size=1024, seg_token_num=1,
-                 max_targets_per_sample=3, min_component_area=100):
+                 max_targets_per_sample=3, min_component_area=100, split='train'):
         super().__init__()
-        self.base = ReasonSegDataset(base_data_path, tokenizer, image_size)
+        self.base = ReasonSegDataset(base_data_path, tokenizer, image_size, split=split)
         self.tokenizer = tokenizer
         self.image_size = image_size
         self.seg_token_num = max(1, seg_token_num)
@@ -738,6 +739,145 @@ class DataCollector(object):
             
         return batch
     
+class MUSEDataset(Dataset):
+    def __init__(self, base_data_path, tokenizer, image_size=1024, seg_token_num=1, split='val'):
+        super().__init__()
+        self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+        self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+        self.base_data_path = base_data_path
+        self.tokenizer = tokenizer
+        self.image_size = image_size
+        self.seg_token_num = max(1, seg_token_num)
+        self.split = split
+
+        # MUSE json files are in base_data_path/MUSE/MUSE_train.json, MUSE_val.json, etc.
+        # Or base_data_path/MUSE_val.json
+        possible_json_paths = [
+            os.path.join(base_data_path, f"MUSE_{split}.json"),
+            os.path.join(base_data_path, "MUSE", f"MUSE_{split}.json"),
+            os.path.join(base_data_path, "MUSE", "MUSE", f"MUSE_{split}.json"),
+        ]
+        
+        json_path = None
+        for p in possible_json_paths:
+            if os.path.exists(p):
+                json_path = p
+                break
+        
+        if json_path is None:
+            raise FileNotFoundError(f"MUSE json file for split {split} not found in {base_data_path}")
+            
+        with open(json_path, 'r') as f:
+            self.data = json.load(f)
+            
+    def __len__(self):
+        return len(self.data)
+        
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        height = item.get('height', 800)
+        width = item.get('width', 800)
+        coco_url = item.get('coco_url', '')
+        filename = coco_url.split('/')[-1] if coco_url else f"{item['id']:012d}.jpg"
+        
+        # Locate image
+        image_path = None
+        possible_img_paths = [
+            os.path.join(self.base_data_path, filename),
+            os.path.join(self.base_data_path, "train2017", filename),
+            os.path.join(self.base_data_path, "val2017", filename),
+            os.path.join(self.base_data_path, "images", filename),
+            os.path.join(self.base_data_path, "images", "train2017", filename),
+            os.path.join(self.base_data_path, "images", "val2017", filename),
+            # Also support standard MUSE extracted zip location
+            os.path.join(self.base_data_path, "MUSE", filename),
+            os.path.join(self.base_data_path, "MUSE", "train2017", filename),
+            os.path.join(self.base_data_path, "MUSE", "val2017", filename),
+        ]
+        for p in possible_img_paths:
+            if os.path.exists(p):
+                image_path = p
+                break
+                
+        if image_path is not None:
+            image = cv2.imread(image_path)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            h, w = image.shape[:2]
+        else:
+            # Fallback to dummy image if not found, to avoid crash
+            image = np.zeros((height, width, 3), dtype=np.uint8)
+            h, w = height, width
+            
+        processed_image = preprocess_image(image, self.image_size)
+        processed_image = (torch.tensor(processed_image) - self.pixel_mean) / self.pixel_std
+        
+        data_dict = {}
+        data_dict['image'] = processed_image
+        
+        # Build masks and answers
+        ann_list = item.get('ann_list', [])
+        masks = []
+        target_texts = []
+        
+        for ann in ann_list:
+            seg = ann.get('segmentation', None)
+            if seg is not None:
+                if type(seg[0]) == list: # Polygon
+                    rle = mask.frPyObjects(seg, h, w)
+                else:
+                    rle = seg
+                m = mask.decode(rle)
+                if len(m.shape) > 2:
+                    m = np.sum(m, axis=2)
+                m = (m > 0).astype(np.uint8)
+                masks.append(preprocess_mask(m, self.image_size))
+                
+                # Use rephrased name as referring target text
+                text = ann.get('rephrased_name', ann.get('category_name', 'target object'))
+                target_texts.append(text)
+                
+        if len(masks) == 0:
+            # Fallback if no target exists
+            masks = [torch.zeros((1, self.image_size, self.image_size), dtype=torch.uint8)]
+            target_texts = ["target object"]
+            
+        num_targets = len(masks)
+        data_dict['masks'] = masks
+        
+        # Construct template instruction for LLaVA
+        prefix_inst = 'This is an image <image>, Please doing Referring Segmentation according to the following instruction:'
+        # For multi-target we instruct to segment all targets
+        instruction = " Please segment the target objects."
+        
+        sources = [[{'from': 'human', 'value': prefix_inst + '\n<refer>'},
+                    {'from': 'gpt', 'value': 'Sure, It is <seg>. \n<answer>.'}]]
+                    
+        text_dict = preprocess_llama2(sources, self.tokenizer)
+        input_ids = text_dict['input_ids'][0]
+        labels = text_dict['labels'][0]
+        
+        data_dict['input_ids'] = input_ids
+        data_dict['labels'] = labels
+        data_dict['dataset_type'] = 'reason_seg' # Reuse existing reasoning / multi-target forward pass logic
+        
+        token_refer_id = preprocess_referring_instruction(instruction, self.tokenizer)
+        token_answer_id, target_group_ids = preprocess_multi_target_answer(
+            target_texts, self.tokenizer, self.seg_token_num)
+            
+        refer_embedding_indices = torch.zeros_like(input_ids)
+        refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
+        answer_embedding_indices = torch.zeros_like(input_ids)
+        answer_embedding_indices[input_ids == ANSWER_TOKEN_INDEX] = 1
+        
+        data_dict['token_refer_id'] = token_refer_id
+        data_dict['token_answer_id'] = token_answer_id
+        data_dict['target_group_ids'] = target_group_ids
+        data_dict['refer_embedding_indices'] = refer_embedding_indices
+        data_dict['answer_embedding_indices'] = answer_embedding_indices
+        
+        return data_dict
+
+
 if __name__ == "__main__":
     
     conversation_lib.default_conversation = conversation_lib.conv_templates['llava_phi']

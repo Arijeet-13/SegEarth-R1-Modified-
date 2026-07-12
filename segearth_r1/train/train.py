@@ -14,6 +14,15 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+# Hotfix for PyTorch / DeepSpeed distributed elasticity import compatibility bug
+import logging
+try:
+    import torch.distributed.elastic.agent.server.api
+    if not hasattr(torch.distributed.elastic.agent.server.api, 'log'):
+        torch.distributed.elastic.agent.server.api.log = logging.getLogger("torch.distributed.elastic.agent.server.api")
+except ImportError:
+    pass
+
 from train_dataset import *
 from segearth_r1.train.llava_trainer import LLaVATrainer
 from segearth_r1.train.liss4_train_dataset import Liss4ReasonSegDataset
@@ -351,28 +360,49 @@ def _add_speaker_and_signal(header, source, get_conversation=True):
     return conversation
 
 
-def make_unify_datamodule(tokenizer, data_args, training_args):
+def make_unify_datamodule(tokenizer, data_args, training_args, model_args=None):
     data_ratio = data_args.data_ratio
     data_ratio = data_ratio.split('||')
     data_ratio = [int(data_) for data_ in data_ratio]
     base_data_path = data_args.data_path
-    if data_args.dataset_type == 'RRSIS-D':
-        print("current train dataset is RRSIS-D")
-        Data = RRSISDDataset(base_data_path=base_data_path, tokenizer=tokenizer)
-    if data_args.dataset_type == 'EarthReason':
-        print("current train dataset is EarthReason")
-        Data = ReasonSegDataset(base_data_path=base_data_path, tokenizer=tokenizer)
-    if data_args.dataset_type == 'Liss4Reason':
-        print("current train dataset is Liss4Reason")
-        Data = Liss4ReasonSegDataset(base_data_path=base_data_path, tokenizer=tokenizer, split='train')
-    if data_args.dataset_type == 'RefSegRS':
-        print("current train dataset is RefSegRS")
-        Data = RefSegRSDataset(base_data_path=base_data_path, tokenizer=tokenizer)
-    if data_args.dataset_type == 'MM_Conv':
-        print("current train dataset is MM_Conv")
-        Data = MM_Conv_Dataset(base_data_path=base_data_path, tokenizer=tokenizer, data_args=data_args)
+    
+    use_multi_target_seg = getattr(model_args, 'use_multi_target_seg', False) if model_args is not None else False
+    seg_token_num = getattr(model_args, 'seg_token_num', 1) if model_args is not None else 1
+
+    if use_multi_target_seg and data_args.dataset_type == 'MUSE':
+        print("current train dataset is MUSE (Multi-Target)")
+        from segearth_r1.train.train_dataset import MUSEDataset, MultiTargetDataCollector
+        Data = MUSEDataset(
+            base_data_path=base_data_path,
+            tokenizer=tokenizer,
+            seg_token_num=seg_token_num,
+            split='train'
+        )
+        data_collator = MultiTargetDataCollector(tokenizer=tokenizer)
+    else:
+        if use_multi_target_seg:
+            print(f"Warning: Multi-target segmentation is only supported for MUSE, but dataset_type is {data_args.dataset_type}. Falling back to standard single-target dataset class.")
+            
+        if data_args.dataset_type == 'RRSIS-D':
+            print("current train dataset is RRSIS-D")
+            Data = RRSISDDataset(base_data_path=base_data_path, tokenizer=tokenizer)
+        elif data_args.dataset_type == 'EarthReason':
+            print("current train dataset is EarthReason")
+            Data = ReasonSegDataset(base_data_path=base_data_path, tokenizer=tokenizer)
+        elif data_args.dataset_type == 'Liss4Reason':
+            print("current train dataset is Liss4Reason")
+            Data = Liss4ReasonSegDataset(base_data_path=base_data_path, tokenizer=tokenizer, split='train')
+        elif data_args.dataset_type == 'RefSegRS':
+            print("current train dataset is RefSegRS")
+            Data = RefSegRSDataset(base_data_path=base_data_path, tokenizer=tokenizer)
+        elif data_args.dataset_type == 'MM_Conv':
+            print("current train dataset is MM_Conv")
+            Data = MM_Conv_Dataset(base_data_path=base_data_path, tokenizer=tokenizer, data_args=data_args)
+        else:
+            raise ValueError(f"Unknown dataset_type: {data_args.dataset_type}")
+        data_collator = DataCollector(tokenizer=tokenizer)
+
     print(f'total unify dataset number is {len(Data)}')
-    data_collator = DataCollector(tokenizer=tokenizer)
     return dict(train_dataset=Data, eval_dataset=None, data_collator=data_collator)
 
 def train():
@@ -489,7 +519,7 @@ def train():
         seg_m_kwargs['SEG_M'] = tokenizer(DEFAULT_SEG_M_TOKEN, return_tensors='pt', add_special_tokens=False)['input_ids']
     model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id, **seg_m_kwargs)
 
-    data_module = make_unify_datamodule(tokenizer=tokenizer, data_args=data_args, training_args=training_args) 
+    data_module = make_unify_datamodule(tokenizer=tokenizer, data_args=data_args, training_args=training_args, model_args=model_args) 
     training_args.dataloader_drop_last = True
     trainer = LLaVATrainer(model=model,
                            tokenizer=tokenizer,
